@@ -28,7 +28,7 @@ async function until(predicate, description) {
 }
 
 async function socketFixture(t, reply) {
-  const directory = await mkdtemp("/tmp/opencode/lifecycle-tui-");
+  const directory = await mkdtemp(join(tmpdir(), "lifecycle-tui-"));
   const path = join(directory, "s");
   const reports = [];
   const sockets = new Set();
@@ -374,3 +374,4 @@ test("outside Herdr the plugin starts no subscriptions, timers or RPCs", async (
   assert.equal(ui.listeners.size, 0);
   assert.deepEqual(reports, []);
 });
+import { tmpdir } from 'node:os';

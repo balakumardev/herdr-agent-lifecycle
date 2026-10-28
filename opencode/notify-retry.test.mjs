@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -13,7 +14,7 @@ const notice = { key: 'done:ses_retry:msg_final', title: 'Done: test', message: 
 const epoch = Date.parse('2026-10-07T04:00:00Z');
 
 async function fixture(t, status = 503, retryAfter) {
-  const directory = await mkdtemp('/tmp/opencode/retry-test-');
+  const directory = await mkdtemp(join(tmpdir(), 'retry-test-'));
   const state = { now: epoch, status, retryAfter, requests: [] };
   const server = createServer(async (request, response) => {
     let body = '';

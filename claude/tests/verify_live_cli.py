@@ -56,9 +56,8 @@ def main():
     server.delivered = threading.Event()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     results = []
-    base = '/tmp/opencode' if Path('/tmp/opencode').is_dir() else None
     try:
-        with tempfile.TemporaryDirectory(dir=base, prefix='live-claude-') as directory:
+        with tempfile.TemporaryDirectory(prefix='live-claude-') as directory:
             root = Path(directory)
             topic = root / 'topic.sh'
             topic.write_text('TOPIC="local-test-only"\n')

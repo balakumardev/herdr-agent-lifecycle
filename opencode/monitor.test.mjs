@@ -236,7 +236,7 @@ test('completion bodies fit ntfy in UTF-8 with an explicit ellipsis only when tr
 });
 
 test('the existing notifier sends the final reply but persists only metadata and deduplicates it', async (t) => {
-  const directory = await mkdtemp('/tmp/opencode/final-reply-test-');
+  const directory = await mkdtemp(join(tmpdir(), 'final-reply-test-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const topicFile = join(directory, 'topic.sh');
   const stateDirectory = join(directory, 'state');
@@ -455,3 +455,4 @@ test('a failed startup-seeded inspection is retried without a new event or TUI r
   assert.equal(loads, 2);
   assert.equal(published.length, 1);
 });
+import { tmpdir } from 'node:os';

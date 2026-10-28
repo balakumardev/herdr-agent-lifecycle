@@ -23,7 +23,7 @@ from test_transport import Receiver
 
 class DeliveryRetryTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="claude-delivery-retry-", dir="/tmp/opencode")
+        self.tmp = tempfile.TemporaryDirectory(prefix="claude-delivery-retry-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.state_dir = self.root / "state"

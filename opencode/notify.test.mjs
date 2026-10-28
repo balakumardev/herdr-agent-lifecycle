@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
@@ -13,7 +14,7 @@ const payload = { key: "private-session:completed:42", title: "Private title", m
 const topic = "private-fixture-topic";
 
 async function fixture(t, respond = (_request, response) => response.end("ok")) {
-  const directory = await mkdtemp("/tmp/opencode/notify-test-");
+  const directory = await mkdtemp(join(tmpdir(), "notify-test-"));
   const clock = { now: Date.now() };
   const requests = [];
   const server = createServer(async (request, response) => {

@@ -47,7 +47,7 @@ class TransportTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self.module = module
-        self.tmp = tempfile.TemporaryDirectory(prefix="claude-lifecycle-", dir="/tmp/opencode")
+        self.tmp = tempfile.TemporaryDirectory(prefix="claude-lifecycle-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.topic_file = self.root / "ntfy-notify.sh"

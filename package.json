@@ -1,0 +1,17 @@
+{
+  "name": "herdr-agent-lifecycle",
+  "version": "0.0.0-development",
+  "private": true,
+  "type": "module",
+  "description": "Task-aware Herdr completion reporting for Claude Code and OpenCode",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/balakumardev/herdr-agent-lifecycle.git" },
+  "engines": { "node": ">=22.14.0" },
+  "scripts": {
+    "test": "python3 scripts/test.py",
+    "test:opencode": "npm test --prefix opencode",
+    "test:claude": "python3 -m unittest discover -s claude/tests -p 'test_*.py'",
+    "test:native": "claude plugin validate claude && claude plugin test claude",
+    "release": "semantic-release"
+  }
+}

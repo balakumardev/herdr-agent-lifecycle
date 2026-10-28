@@ -2,9 +2,15 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 test('the V2 Claude compatibility bridge leaves notifications to the lifecycle integration', async () => {
-  const source = await readFile(new URL('../../plugins/claude-code-hooks.js', import.meta.url), 'utf8');
+  const legacy = await readFile(new URL('../tests/fixtures/legacy-bridge.js', import.meta.url), 'utf8');
+  const source = execFileSync('python3', ['-c',
+    'import runpy,sys; print(runpy.run_path(sys.argv[1])["patch_bridge"](sys.stdin.read()), end="")',
+    fileURLToPath(new URL('../scripts/install-opencode.py', import.meta.url)),
+  ], { input: legacy, encoding: 'utf8' });
   const spawned = [];
   const oldSpawn = globalThis.__lifecycleTestSpawn;
   globalThis.__lifecycleTestSpawn = (command) => {

@@ -48,7 +48,7 @@ def finish_hook(hook_input, hook_id, run_id, exit_code):
 class HookRunnerTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue((ROOT / "hook_runner.py").is_file(), "hook runner is not implemented yet")
-        self.tmp = tempfile.TemporaryDirectory(prefix="lifecycle-runner-", dir="/tmp/opencode")
+        self.tmp = tempfile.TemporaryDirectory(prefix="lifecycle-runner-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.runner = self.root / "hook_runner.py"

@@ -29,9 +29,10 @@ def snapshot(root):
 class InstallTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue((ROOT / "install.py").is_file(), "installer is not implemented yet")
-        self.tmp = tempfile.TemporaryDirectory(prefix="lifecycle-install-", dir="/tmp/opencode")
+        self.tmp = tempfile.TemporaryDirectory(prefix="lifecycle-install-")
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # The installer canonicalizes --home; macOS /var is a symlink.
+        self.root = Path(self.tmp.name).resolve()
         self.home = self.root / "home with spaces"
         self.claude = self.home / ".claude"
         self.source = self.root / "source with spaces"

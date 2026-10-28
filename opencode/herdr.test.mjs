@@ -10,7 +10,7 @@ const working = { rootID: "ses_root", state: "working", reason: "child-active" }
 async function socketFixture(t, reply = (request, socket) => {
   socket.end(`${JSON.stringify({ id: request.id, result: { type: "ok" } })}\n`);
 }) {
-  const directory = await mkdtemp("/tmp/opencode/lifecycle-herdr-");
+  const directory = await mkdtemp(join(tmpdir(), "lifecycle-herdr-"));
   const path = join(directory, "s");
   const requests = [];
   const sockets = new Set();
@@ -198,3 +198,4 @@ test("a replacement reporter fences old reports and old cleanup never releases i
   ]);
   assert.ok(requests[2].params.seq > requests[1].params.seq);
 });
+import { tmpdir } from 'node:os';
