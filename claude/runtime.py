@@ -304,8 +304,11 @@ class Runtime:
             except BlockingIOError:
                 return
             env = {**self.env, "CLAUDE_TASK_LIFECYCLE_STATE_DIR": str(self.root.resolve()),
-                   "CLAUDE_TASK_LIFECYCLE_TOPIC_FILE": str(self.transport.topic_file.resolve()),
                    "CLAUDE_TASK_LIFECYCLE_ENDPOINT": self.transport.endpoint}
+            if self.transport.topic_file is not None:
+                env["CLAUDE_TASK_LIFECYCLE_TOPIC_FILE"] = str(self.transport.topic_file.resolve())
+            else:
+                env.pop("CLAUDE_TASK_LIFECYCLE_TOPIC_FILE", None)
             process = subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve()), "--delivery-worker", str(descriptor)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

@@ -32,7 +32,7 @@ shasum -a 256 -c SHA256SUMS
 tar -xzf "herdr-agent-lifecycle-${VERSION#v}.tar.gz"
 cd "herdr-agent-lifecycle-${VERSION#v}"
 npm ci --prefix opencode --ignore-scripts
-npm test
+npm run test:runtime
 ```
 
 ### OpenCode
@@ -147,6 +147,7 @@ reason. Review, continuation, question, and permission gates apply in both modes
 Requires Node 22.14+, Python 3.9+, and macOS or Linux.
 
 ```sh
+npm ci
 npm ci --prefix opencode
 npm test
 claude plugin validate claude
@@ -155,6 +156,52 @@ claude plugin test claude
 
 The portable tests use temporary homes and loopback HTTP/socket fixtures.
 Native Claude tests require a compatible locally installed Claude CLI.
+
+The live host checks use a local model-stream fixture and loopback notifications:
+
+```sh
+python3 claude/tests/verify_live_cli.py
+```
+
+Named-teammate cases use a pseudo-terminal because current Claude does not
+create teammates in `-p` mode. They require an attended Claude session to have
+already approved any organization-managed settings. The fixture stops on that
+approval prompt. It verifies both strict-pending and opted-in completion behavior;
+an unavailable teammate, denied Agent tool or missing snapshot fails the check.
+
+## Automatic releases
+
+```text
+PR merged into main/master
+          ↓
+Linux + macOS tests
+          ↓
+Conventional Commit → next shared version
+          ↓
+versioned manifests + CHANGELOG + vX.Y.Z tag
+          ↓
+GitHub release: source archive + OpenCode package + SHA256SUMS
+```
+
+Use a Conventional Commit title when squash-merging:
+
+| Commit | Release |
+| --- | --- |
+| `fix: preserve pending work` | Patch |
+| `feat: observe a new work type` | Minor |
+| `feat!: require a newer host API` | Major |
+| `docs:`, `ci:`, `test:`, `refactor:`, `chore:`, other configured maintenance types | Patch |
+
+The workflow uses the job-scoped `GITHUB_TOKEN`; no npm publishing credential is
+needed. Only the release job has write access. Pipelines are serialized and the
+release uses its tested commit. Generated release commits use `[skip ci]`.
+Re-running a completed release with no new commits creates no new version.
+Use the workflow's manual dispatch to retry a failed run after fixing its cause.
+
+If you later protect `main`/`master` against release commits, configure an
+appropriately scoped GitHub App for the release job. Do not substitute a broad
+personal token. Ordinary non-Conventional Commit messages do not trigger a
+release; use squash-merge titles to keep the version policy predictable.
 
 ## Origins
 

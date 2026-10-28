@@ -10,9 +10,9 @@ commands = [
     ["npm", "test", "--prefix", "opencode"],
     [sys.executable, "-B", "-m", "unittest", "discover", "-s", "claude/tests", "-p", "test_*.py"],
 ]
-if list((root / "tests").glob("test_*.py")):
+if "--runtime-only" not in sys.argv and list((root / "tests").glob("test_*.py")):
     commands.append([sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"])
-if list((root / "tests").glob("*.test.mjs")):
+if "--runtime-only" not in sys.argv and list((root / "tests").glob("*.test.mjs")):
     commands.append(["node", "--test", *[str(p) for p in sorted((root / "tests").glob("*.test.mjs"))]])
 with tempfile.TemporaryDirectory(prefix="lifecycle-suites-") as temporary:
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", XDG_STATE_HOME=temporary,

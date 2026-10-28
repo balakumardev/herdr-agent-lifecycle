@@ -1,6 +1,7 @@
 import { OpenCode } from '@opencode/client';
 import { Service } from '@opencode/client/service';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readFileSync } from 'node:fs';
 import { LifecycleRPC } from './contract.mjs';
 import { loadTask } from './lifecycle.mjs';
 import { TaskMonitor } from './monitor.mjs';
@@ -9,35 +10,46 @@ import { createNotifier } from './notify.mjs';
 // Plugins load once per location. The HTTP/event monitor must instead be owned
 // once by this service process, regardless of the number of open worktrees.
 const sharedKey = Symbol.for('local.opencode.task-lifecycle.v3');
-const build = '1.0.2';
-// Increase when the process-owned implementation changes within a release.
-const revision = 3;
+const build = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+// Public releases are a new implementation generation after the local r3 build.
+const revision = 4;
+
+function newerBuild(current) {
+  if ((current.revision || 0) !== revision) return (current.revision || 0) < revision;
+  const previous = String(current.build || '0.0.0').split('.').map(Number);
+  const next = build.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if (next[i] !== previous[i]) return next[i] > previous[i];
+  }
+  return false;
+}
 
 function acquire() {
   let shared = globalThis[sharedKey];
   if (!shared) {
+    const notifier = createNotifier();
     shared = { refs: 0, controller: new AbortController(), monitor: undefined, build, revision };
     globalThis[sharedKey] = shared;
-    void connect(shared);
-  } else if ((shared.revision || 0) < revision) {
+    void connect(shared, notifier);
+  } else if (newerBuild(shared)) {
+    const notifier = createNotifier();
     // One watched plugin reload upgrades the process-owned monitor, even while
     // other locations retain references. Keep pending observations through reload.
     shared.controller.abort();
     shared.controller = new AbortController();
     shared.monitor = shared.monitor ? new TaskMonitor({
-      previous: shared.monitor, load: shared.monitor.load, notifier: createNotifier(),
+      previous: shared.monitor, load: shared.monitor.load, notifier,
     }) : undefined;
     shared.build = build;
     shared.revision = revision;
-    void connect(shared);
+    void connect(shared, notifier);
   }
   shared.refs++;
   return shared;
 }
 
-async function connect(shared) {
+async function connect(shared, notifier) {
   const { signal } = shared.controller;
-  const notifier = createNotifier();
   let interval;
   let refreshing = false;
   while (!signal.aborted) {

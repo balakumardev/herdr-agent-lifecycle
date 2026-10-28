@@ -136,4 +136,7 @@ the shared OpenCode service or reload unrelated running Claude sessions.
   126 OpenCode and 163 Python tests pass, plus 15 native Claude mod tests and
   successful native validation on Claude 2.1.311. The validator's optional
   marketplace-icon warning does not affect CLI installation.
-- Next: Task 3 installers and public marketplace.
+- Task 3 complete: commit `0d938e4`; 126 Node, 168 Python and 10 OpenCode installer
+  tests pass. Both Claude plugin and public marketplace pass native validation.
+  Both installers have dry-run/idempotence and guarded restoration coverage.
+- Next: Task 4 automated releases and package validation.

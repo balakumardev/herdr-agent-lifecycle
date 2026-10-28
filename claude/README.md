@@ -82,7 +82,7 @@ python3 tests/verify_live_cli.py
 
 The Python tests use local HTTP/Unix sockets and temporary files, including cross-process outage bursts, restart/backoff suppression, Retry-After, terminal failures, detached final-turn recovery, cancellation, review/owner fencing, deterministic re-admission races, ENOSPC recovery, and metadata privacy. Native mod tests use Claude's test engine, with no model requests. A live CLI check also exercises actual engine callbacks with a deterministic local model-stream fixture and a local notification receiver.
 
-Native tests run outside the default security guard, so passing those tests alone does not establish that a native `classic.*` handler works in a real session. The live verification specifically covers this distinction. `python3 tests/verify_live_cli.py --case named-teammate` selects the reusable-teammate case and requires a real running teammate record in native Stop after child work finishes. A policy/authentication denial of Agent is a setup failure, not a lifecycle RED or pass; do not bypass managed policy to run it.
+Native tests run outside the default security guard, so passing those tests alone does not establish that a native `classic.*` handler works in a real session. The live verification covers this distinction. `--case named-teammate` selects the opted-in reusable-teammate case; `--case named-teammate-strict` verifies the strict default. Both require a real running teammate record in native Stop after child work finishes and run interactively in a pseudo-terminal. Current Claude cannot spawn teammates in `-p` mode. A managed-settings approval or policy/authentication denial is an explicit setup failure; the fixture never bypasses it.
 
 ## Diagnostics
 

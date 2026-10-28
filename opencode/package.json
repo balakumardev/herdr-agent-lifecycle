@@ -1,9 +1,13 @@
 {
-  "name": "local-opencode-task-lifecycle",
+  "name": "opencode-herdr-lifecycle",
   "version": "1.0.2",
-  "private": true,
+  "description": "Task-aware Herdr completion and optional ntfy reporting for OpenCode V2",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/balakumardev/herdr-agent-lifecycle.git", "directory": "opencode" },
+  "engines": { "node": ">=22.14.0" },
   "type": "module",
   "exports": { ".": "./index.js", "./tui": "./tui.js" },
+  "files": ["index.js", "tui.js", "config.mjs", "contract.mjs", "herdr.mjs", "lifecycle.mjs", "monitor.mjs", "notify.mjs", "README.md", "LICENSE"],
   "scripts": { "test": "node --test *.test.mjs" },
   "dependencies": { "@opencode/client": "2.0.18" }
 }

@@ -176,6 +176,25 @@ class DeliveryRetryTests(unittest.TestCase):
             self.assertEqual(len(self.processes), 1, "each notification admission spawned another sleeping process")
         self.assertEqual(len(self.server.messages), 1)
 
+    def test_configured_topic_survives_detached_worker_launch_without_a_legacy_file(self):
+        config = self.root / "config.json"
+        config.write_text(json.dumps({"notifications": {"enabled": True, "topic": "configured-topic",
+                                                      "endpoint": self.transport.endpoint}}))
+        env = {k: v for k, v in self.env.items() if k not in (
+            "CLAUDE_TASK_LIFECYCLE_TOPIC_FILE", "CLAUDE_TASK_LIFECYCLE_ENDPOINT")}
+        env["HERDR_LIFECYCLE_CONFIG"] = str(config)
+        self.stop()
+        packet = self.packet("complete", turn_id="turn-one", has_answer=True, reason="answer",
+                             answer_text="Configured final reply")
+        command = subprocess.run([sys.executable, "-B", str(ROOT / "runtime.py")], input=json.dumps(packet),
+                                 text=True, capture_output=True, cwd=ROOT, env=env, timeout=5)
+        self.assertEqual((command.returncode, command.stderr), (0, ""), command.stdout)
+        self.assertEqual(json.loads(command.stdout)["state"], "idle")
+        self.wait_for(lambda: len(self.receipts()) == 1, "configured background delivery")
+        self.assertEqual(self.receipts()[0]["status"], "sent")
+        self.assertEqual([(path, body.decode()) for path, _, body in self.server.messages],
+                         [("/configured-topic", "Configured final reply")])
+
     def test_session_end_preserves_a_qualified_deferred_final_reply(self):
         self.server.codes = [503, 200]
         self.complete()
