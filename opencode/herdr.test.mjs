@@ -62,7 +62,7 @@ test("reports the root identity and resumable V2 command on the pane captured at
     agent: "opencode-v2",
     state: "working",
     agent_session_id: "ses_root",
-    resume_argv: ["opencode2", "--session", "ses_root"],
+    resume_argv: ["opencode", "--session", "ses_root"],
     message: "child-active",
   });
 });
@@ -75,6 +75,13 @@ test("skips reporting outside a fully identified Herdr pane", async (t) => {
     assert.equal(await client.report(working), false);
   }
   assert.equal(requests.length, 0);
+});
+
+test("a configured executable is reported as one argv entry without shell interpretation", async (t) => {
+  const { requests, env } = await socketFixture(t);
+  const client = reporter(t, env, { command: "/Applications/OpenCode CLI/opencode" });
+  assert.equal(await client.report(working), true);
+  assert.deepEqual(requests[0].params.resume_argv, ["/Applications/OpenCode CLI/opencode", "--session", "ses_root"]);
 });
 
 test("coalesces acknowledged identical states but orders changed roots and states", async (t) => {

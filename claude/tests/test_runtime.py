@@ -71,7 +71,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["state"], "idle")
         self.assertEqual([n["kind"] for n in self.transport.notices], ["done"])
 
-    def teammate_stop(self, **changes):
+    def teammate_stop(self, allow_idle_teammates=True, **changes):
+        # Existing roster coverage exercises the explicitly opted-in policy.
+        if allow_idle_teammates is not None:
+            self.runtime.allow_idle_teammates = allow_idle_teammates
         # Native task IDs are not the public agent loop IDs.
         return self.runtime.observe_hook({
             "hook_event_name": "Stop", "session_id": "session-1",
@@ -95,6 +98,21 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((result["state"], result["reason"]), ("idle", "task_complete"))
         self.assertEqual([notice["kind"] for notice in self.transport.notices], ["done"])
         self.assertEqual(self.transport.notices[0]["message"], "Both delegated checks are complete.")
+
+    def test_default_policy_cannot_infer_empty_inboxes_from_idle_teammates(self):
+        self.teammate_stop(allow_idle_teammates=None)
+        result = self.complete_with_idle_agents()
+        self.assertEqual((result["state"], result["reason"]), ("working", "teammate_completion_unproven"))
+        self.assertEqual(self.transport.notices, [])
+        self.event("start", turn_id="turn-2")
+        self.stop()
+        self.assertEqual(self.complete(turn_id="turn-2")["state"], "idle")
+        self.assertEqual(len(self.transport.notices), 1)
+
+    def test_truthy_string_is_not_idle_teammate_opt_in(self):
+        self.teammate_stop(allow_idle_teammates="true")
+        self.assertEqual(self.complete_with_idle_agents()["state"], "working")
+        self.assertEqual(self.transport.notices, [])
 
     def test_idle_teammates_with_terminal_agents_notify_once(self):
         self.teammate_stop()

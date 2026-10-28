@@ -130,4 +130,10 @@ the shared OpenCode service or reload unrelated running Claude sessions.
   all 43 manifest hashes verified before source import.
 - Prior intbox audit: 156 Python, 15 native Claude, 113 OpenCode tests passed.
 - Current Mac observed: OpenCode 2.0.18, Claude 2.1.311, Herdr 0.9.3.
-- Next: copy baseline and implement Task 1.
+- Task 1 complete: commit `809e821`; 113 OpenCode and 156 Python tests pass on
+  macOS after portable fixture repairs, retaining the inherited assertions.
+- Task 2 complete: new configuration/strict-policy tests went red, then green;
+  126 OpenCode and 163 Python tests pass, plus 15 native Claude mod tests and
+  successful native validation on Claude 2.1.311. The validator's optional
+  marketplace-icon warning does not affect CLI installation.
+- Next: Task 3 installers and public marketplace.

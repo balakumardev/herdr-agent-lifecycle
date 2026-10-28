@@ -128,7 +128,7 @@ test("root inactivity and child navigation still bind authoritative working stat
   assert.deepEqual(ui.calls[0].input, { sessionID: "ses_child" });
   assert.deepEqual(ui.calls[0].options.location, { directory: "/selected-project" });
   assert.deepEqual(states(reports), [["ses_root", "working"]]);
-  assert.deepEqual(reports[0].params.resume_argv, ["opencode2", "--session", "ses_root"]);
+  assert.deepEqual(reports[0].params.resume_argv, ["opencode", "--session", "ses_root"]);
   ui.emit("session.execution.succeeded", { sessionID: "ses_root" });
   await until(() => ui.calls.length === 2, "refresh after root exit");
   await delay(35);

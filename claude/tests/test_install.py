@@ -46,7 +46,7 @@ class InstallTests(unittest.TestCase):
         self.project_path = self.claude / "plugins/cache/project/hooks/hooks.json"
         self.managed_path = self.root / "managed/hooks/hooks.json"
         self.shim = self.claude / "hooks/ntfy-notify.sh"
-        for name in ("install.py", "hook_runner.py", "event_hook.py", "runtime.py", "transport.py", "bash_conditions.py"):
+        for name in ("install.py", "hook_runner.py", "event_hook.py", "runtime.py", "transport.py", "configuration.py", "bash_conditions.py"):
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# Portable fixture module.\n")

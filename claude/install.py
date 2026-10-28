@@ -21,7 +21,7 @@ from transport import locked
 
 EVENTS = frozenset(("Stop", "SubagentStop", "UserPromptSubmit", "PostToolUse"))
 ARTIFACTS = (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.js",
-             "runtime.py", "transport.py", "bash_conditions.py", "event_hook.py", "hook_runner.py", "install.py")
+              "runtime.py", "transport.py", "configuration.py", "bash_conditions.py", "event_hook.py", "hook_runner.py", "install.py")
 OPTIONAL_ARTIFACTS = ("README.md", "tests/verify_live_cli.py",
                       "tests/live-fixture/.claude-plugin/plugin.json",
                       "tests/live-fixture/hooks/hooks.json")

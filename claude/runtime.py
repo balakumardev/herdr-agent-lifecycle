@@ -82,6 +82,8 @@ def classify(state):
         return "working", "pending_continuation"
     if state.get("children"):
         return "working", "subagents_running"
+    if state.get("teammate_completion_unproven"):
+        return "working", "teammate_completion_unproven"
     if state.get("running"):
         return "working", "parent_running"
     if state.get("candidate"):
@@ -206,12 +208,14 @@ def audit_hooks(event, config_dir=None):
 
 
 class Runtime:
-    def __init__(self, state_dir, transport, *, env=None, hook_audit=audit_hooks, background_delivery=False):
+    def __init__(self, state_dir, transport, *, env=None, hook_audit=audit_hooks, background_delivery=False,
+                 allow_idle_teammates=False):
         self.root = Path(state_dir)
         self.transport = transport
         self.env = dict(os.environ if env is None else env)
         self.hook_audit = hook_audit
         self.background_delivery = background_delivery
+        self.allow_idle_teammates = allow_idle_teammates is True
 
     def path(self, session_id):
         return self.root / "sessions" / (digest(session_id) + ".json")
@@ -440,6 +444,7 @@ class Runtime:
         state["candidate"] = None
         state["stop"] = None
         state["final_notice"] = None
+        state["teammate_completion_unproven"] = False
 
     def _prepare(self, state, event, expected, unknown):
         state["unknown_hook"] = bool(unknown) or state.get("unknown_hook", False)
@@ -606,6 +611,8 @@ class Runtime:
                     return {"ignored": True, "reason": "old_turn"}
                 state["running"] = False
                 stop = state.get("stop") or {}
+                state["teammate_completion_unproven"] = bool(
+                    stop.get("teammate_count") and not stop.get("empty") and self.allow_idle_teammates is not True)
                 if not stop.get("teammate_count"):
                     state["questions"], state["permissions"] = [], []
                 # Native turn.complete is emitted after the engine's Stop-loop
@@ -618,7 +625,7 @@ class Runtime:
                     state["failure"] = "turn_" + str(event.get("reason", "unknown"))
                     state["candidate"] = None
                 elif (event.get("has_answer") is True and stop.get("accepted")
-                      and (stop.get("empty") or observed_idle_teammates(stop, event))
+                      and (stop.get("empty") or (self.allow_idle_teammates is True and observed_idle_teammates(stop, event)))
                       and stop.get("revision") == state["revision"] and stop.get("turn_id") == event["turn_id"]
                       and not state["children"] and not state.get("continuation")
                       and not state["questions"] and not state["permissions"]):
@@ -700,12 +707,17 @@ class Runtime:
 
 
 def default_runtime():
+    from configuration import load_config
+    config = load_config()
     home = Path.home()
     root = Path(os.environ.get("CLAUDE_TASK_LIFECYCLE_STATE_DIR") or
                 Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")) / "claude/task-lifecycle")
-    topic = Path(os.environ.get("CLAUDE_TASK_LIFECYCLE_TOPIC_FILE") or home / ".claude/hooks/ntfy-notify.sh")
-    endpoint = os.environ.get("CLAUDE_TASK_LIFECYCLE_ENDPOINT", "https://ntfy.sh")
-    return Runtime(root, Transport(root, topic, endpoint=endpoint), background_delivery=True)
+    topic_file = os.environ.get("CLAUDE_TASK_LIFECYCLE_TOPIC_FILE")
+    notification = config["notifications"]
+    topic = notification["topic"] if notification["enabled"] else None
+    endpoint = os.environ.get("CLAUDE_TASK_LIFECYCLE_ENDPOINT", notification["endpoint"])
+    return Runtime(root, Transport(root, topic_file, endpoint=endpoint, topic=topic), background_delivery=True,
+                   allow_idle_teammates=config["claude"]["allowIdleTeammates"])
 
 
 def begin_hook(hook_input, hook_id):

@@ -51,7 +51,7 @@ function request(socketPath, payload, { signal, isCurrent, timeoutMs }) {
   });
 }
 
-export function createHerdrReporter(env = process.env, { timeoutMs = 750 } = {}) {
+export function createHerdrReporter(env = process.env, { timeoutMs = 750, command = loadConfig({ env }).opencode.command } = {}) {
   // Capture the TUI's environment once, never the shared server's environment.
   const paneID = env.HERDR_PANE_ID;
   const socketPath = env.HERDR_SOCKET_PATH;
@@ -88,7 +88,7 @@ export function createHerdrReporter(env = process.env, { timeoutMs = 750 } = {})
             seq,
             state: snapshot.state,
             agent_session_id: snapshot.rootID,
-            resume_argv: ["opencode2", "--session", snapshot.rootID],
+            resume_argv: [command, "--session", snapshot.rootID],
             message: snapshot.reason,
           },
         }, {
@@ -113,3 +113,4 @@ export function createHerdrReporter(env = process.env, { timeoutMs = 750 } = {})
     },
   };
 }
+import { loadConfig } from './config.mjs';

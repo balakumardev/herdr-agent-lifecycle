@@ -99,9 +99,11 @@ function retryAfter(value, now) {
 
 /** Transport only: callers supply the lifecycle decision and stable dedup key. */
 export function createNotifier({
+  config = loadConfig(),
   stateDirectory = join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "opencode", "task-lifecycle"),
-  topicFile = join(homedir(), ".claude", "hooks", "ntfy-notify.sh"),
-  endpoint = "https://ntfy.sh",
+  topicFile,
+  topic: configuredTopic = config.notifications.enabled ? config.notifications.topic : undefined,
+  endpoint = config.notifications.endpoint,
   fetchImpl = globalThis.fetch,
   timeoutMs = 5000,
   retryBaseMs = 30_000,
@@ -180,12 +182,15 @@ export function createNotifier({
           if (!key || typeof key !== "string" || typeof title !== "string" || typeof message !== "string") {
             return receipt("failed", { reason: "invalid_input" });
           }
-          let source;
-          try { source = await readFile(topicFile, "utf8"); }
-          catch (error) { if (error.code === "ENOENT") return receipt("disabled", { reason: "no_topic" }); throw error; }
-          const match = source.match(/^\s*TOPIC=(?:"([A-Za-z0-9_-]+)"|'([A-Za-z0-9_-]+)'|([A-Za-z0-9_-]+))\s*(?:#.*)?$/m);
-          const topic = match?.[1] || match?.[2] || match?.[3];
-          if (!topic) return receipt("disabled", { reason: "no_topic" });
+          let topic = configuredTopic;
+          if (topicFile !== undefined) {
+            let source;
+            try { source = await readFile(topicFile, "utf8"); }
+            catch (error) { if (error.code === "ENOENT") return receipt("disabled", { reason: "no_topic" }); throw error; }
+            const match = source.match(/^\s*TOPIC=(?:"([A-Za-z0-9_-]+)"|'([A-Za-z0-9_-]+)'|([A-Za-z0-9_-]+))\s*(?:#.*)?$/m);
+            topic = match?.[1] || match?.[2] || match?.[3];
+          }
+          if (typeof topic !== "string" || !/^[A-Za-z0-9_-]{1,256}$/.test(topic)) return receipt("disabled", { reason: "no_topic" });
           const directory = join(stateDirectory, keyHash);
           const check = async () => {
             const buffered = writebacks.get(endpointDirectory);
@@ -270,3 +275,4 @@ export function createNotifier({
     },
   };
 }
+import { loadConfig } from './config.mjs';

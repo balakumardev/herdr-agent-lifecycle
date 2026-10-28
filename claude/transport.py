@@ -92,10 +92,11 @@ def retry_after(value, now):
 
 
 class Transport:
-    def __init__(self, state_dir, topic_file, endpoint="https://ntfy.sh", timeout=2,
-                 retry_delay=30, max_retry_delay=900):
+    def __init__(self, state_dir, topic_file=None, endpoint="https://ntfy.sh", timeout=2,
+                 retry_delay=30, max_retry_delay=900, *, topic=None):
         self.state_dir = Path(state_dir)
-        self.topic_file = Path(topic_file)
+        self.topic_file = Path(topic_file) if topic_file is not None else None
+        self.topic = topic
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
         self.retry_delay = retry_delay
@@ -138,14 +139,16 @@ class Transport:
         receipt = {"keyHash": key, "time": datetime.now(timezone.utc).isoformat(), "event": kind}
         if kind not in ("question", "done") or not session_id or not notice_id:
             return {**receipt, "status": "disabled", "reason": "invalid_event"}
-        try:
-            source = self.topic_file.read_text()
-        except OSError:
-            source = ""
-        match = re.search(r"^\s*TOPIC=(?:\"([A-Za-z0-9_-]+)\"|'([A-Za-z0-9_-]+)'|([A-Za-z0-9_-]+))\s*(?:#.*)?$", source, re.M)
-        if not match:
+        topic = self.topic
+        if self.topic_file is not None:
+            try:
+                source = self.topic_file.read_text()
+            except OSError:
+                source = ""
+            match = re.search(r"^\s*TOPIC=(?:\"([A-Za-z0-9_-]+)\"|'([A-Za-z0-9_-]+)'|([A-Za-z0-9_-]+))\s*(?:#.*)?$", source, re.M)
+            topic = next((value for value in match.groups() if value), None) if match else None
+        if not isinstance(topic, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", topic):
             return {**receipt, "status": "disabled", "reason": "no_topic"}
-        topic = next(value for value in match.groups() if value)
         sent = self.state_dir / "deliveries" / (key + ".json")
         try:
             # Serialize the entire admission + HTTP exchange across sessions.
