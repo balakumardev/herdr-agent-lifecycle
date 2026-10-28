@@ -1,3 +1,9 @@
+## [1.0.1](https://github.com/balakumardev/herdr-agent-lifecycle/compare/v1.0.0...v1.0.1) (2026-10-28)
+
+### Maintenance
+
+* verify independent package installation and rollback ([b6c56b2](https://github.com/balakumardev/herdr-agent-lifecycle/commit/b6c56b28b53cf86b02ebb22e2fbc24faf49265b5))
+
 ## 1.0.0 (2026-10-28)
 
 ### Features
