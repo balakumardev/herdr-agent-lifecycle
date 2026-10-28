@@ -125,10 +125,10 @@ export default {
       let acknowledged = false;
       try {
         const snapshot = await requestSnapshot(api, selection, requestMs);
+        if (!validSnapshot(snapshot)) throw new Error("Invalid lifecycle snapshot");
         // Events arriving during a read can invalidate that read. Coalesce one
         // follow-up rather than publishing an obsolete completion or question.
         if (fresh()) {
-          if (!validSnapshot(snapshot)) throw new Error("Invalid lifecycle snapshot");
           selection.rootID = snapshot.rootID;
           // A send can reach Herdr even if its acknowledgement is lost or raced
           // by new work. The older state no longer proves what the pane shows.

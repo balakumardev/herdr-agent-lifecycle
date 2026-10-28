@@ -12,7 +12,8 @@ Native V2 session-tree state for Herdr and optional ntfy on macOS and Linux.
 - If the final body is missing or unreadable, completion stays unconfirmed and is retried through normal reconciliation. There is no boilerplate fallback. Message text goes only to the notifier, never to the public snapshot RPC, snapshot cache, or persistent receipts/deduplication records.
 - Opening an already completed session does not replay historical completion alerts.
 - Descendants can live in different directories/worktrees. The pane remains attributed to its root.
-- Completed children remain part of the task after their temporary worktrees are removed. Persisted history and queued input are read for every child; forms, permissions and shells are read only from locations in OpenCode's live runtime registry. Registry failures, missing active-child runtimes and locations appearing during the read prevent completion and trigger a fresh snapshot.
+- Completed children remain part of the task after their temporary worktrees are removed. Persisted history and queued input are read for every child; forms, permissions and shells are read only from locations in OpenCode's runtime registry.
+- A registry entry can still be starting up. Failed runtime reads are reconciled only after all issued reads settle and a fresh registry read proves the location is absent. Any successful runtime read, active conversation sharing that directory, or unresolved owned command prevents exclusion. Registry/activity checks run again after the remaining reads; uncertainty prevents completion and triggers a fresh snapshot.
 
 ### Delivery retries
 

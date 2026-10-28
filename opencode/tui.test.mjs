@@ -219,13 +219,14 @@ test("a failed or malformed refresh cannot leave a previously completed pane idl
 });
 
 test("lifecycle traffic during failed snapshots cannot suppress Unknown", async (t) => {
-  for (const initialIdle of [false, true]) {
-    await t.test(initialIdle ? "after confirmed Idle" : "before the first report", async (t) => {
+  for (const failure of ["RPC rejection", "malformed response"]) for (const initialIdle of [false, true]) {
+    await t.test(`${failure}: ${initialIdle ? "after confirmed Idle" : "before the first report"}`, async (t) => {
       const { reports, env } = await socketFixture(t);
       const ui = host({ options: { refreshIntervalMs: 20 },
         response: snapshot({ state: "idle", complete: true, activeCount: 0, reason: "done" }) });
       const fail = () => {
         ui.emit("session.execution.started", { sessionID: "ses_child" });
+        if (failure === "malformed response") return Promise.resolve({ state: "idle", rootID: "ses_root" });
         return Promise.reject(new Error("runtime unavailable"));
       };
       if (!initialIdle) ui.state.resolve = fail;

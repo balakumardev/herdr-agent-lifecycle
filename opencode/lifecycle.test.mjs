@@ -258,3 +258,115 @@ test('a child runtime appearing during a snapshot is reread before completion', 
   assert.equal(result.state, 'blocked');
   assert.deepEqual(result.questionIDs, ['frm_resumed']);
 });
+
+function failingRuntimeFixture() {
+  const fixture = retiredLocationFixture();
+  const { client, root, retired } = fixture;
+  const live = [{ directory: '/project' }, { directory: '/other' }];
+  let reads = 0;
+  client.debug.location.list = async () => reads++ === 0 ? [...live, retired.location] : live;
+  root.time.idle = 140;
+  client.message.list = async () => ({ data: [{ ...snapshot().lastAssistant, time: { completed: 139 } }], cursor: {} });
+  return { ...fixture, live };
+}
+
+test('a listed but failed runtime is reconciled after all its reads settle', async () => {
+  const { client, root, retired } = failingRuntimeFixture();
+  const permission = client.permission.list;
+  client.permission.list = async (input) => {
+    if (input.sessionID === retired.id) await new Promise(setImmediate);
+    return permission(input);
+  };
+  const input = await loadTask(client, root.id);
+  const result = classifyTask(input);
+  assert.equal(result.state, 'working');
+  assert.equal(result.activeCount, 1);
+  assert.ok(input.sessions.some((session) => session.id === retired.id));
+});
+
+test('reconciled runtime failure preserves queued input and parent settlement ordering', async () => {
+  for (const queued of [false, true]) {
+    const { client, root, retired } = failingRuntimeFixture();
+    client.session.active = async () => ({});
+    if (queued) client.session.inbox.list = async ({ sessionID }) => sessionID === retired.id ? [{ id: 'input_retired', sessionID }] : [];
+    else root.time.idle = 100;
+    const result = classifyTask(await loadTask(client, root.id));
+    assert.equal(result.complete, false);
+    assert.equal(result.reason, queued ? 'running' : 'awaiting-parent');
+    assert.equal(result.pendingCount, queued ? 1 : 0);
+  }
+  const { client, root } = failingRuntimeFixture();
+  client.session.active = async () => ({});
+  assert.equal(classifyTask(await loadTask(client, root.id)).complete, true);
+});
+
+test('a failed runtime that remains registered cannot be treated as empty', async () => {
+  const { client, root, retired, live } = failingRuntimeFixture();
+  client.session.active = async () => ({});
+  client.debug.location.list = async () => [...live, retired.location];
+  await assert.rejects(loadTask(client, root.id), /removed-temporary-worktree/);
+});
+
+test('a failed runtime reappearing after reconciliation invalidates completion', async () => {
+  const { client, root, retired, live } = failingRuntimeFixture();
+  client.session.active = async () => ({});
+  let reads = 0;
+  client.debug.location.list = async () => reads++ === 1 ? live : [...live, retired.location];
+  await assert.rejects(loadTask(client, root.id), /Task runtime locations changed/);
+});
+
+test('an active owner or successful runtime read contradicts failure reconciliation', async (t) => {
+  for (const mode of ['active owner', 'successful form read', 'known running shell']) {
+    await t.test(mode, async () => {
+      const { client, root, retired } = failingRuntimeFixture();
+      client.session.active = async () => ({});
+      const knownShells = [];
+      if (mode === 'active owner') {
+        let reads = 0;
+        client.session.active = async () => reads++ === 0 ? { [retired.id]: { type: 'running' } } : {};
+      } else if (mode === 'successful form read') {
+        client.session.form.list = async () => [];
+      } else {
+        knownShells.push({ id: 'sh_unresolved', status: 'running', metadata: { sessionID: retired.id }, location: retired.location });
+        client.shell.get = async () => { throw new Error('Unresolved running shell'); };
+      }
+      await assert.rejects(loadTask(client, root.id, { knownShells }));
+    });
+  }
+});
+
+test('failed runtime reconciliation requires a successful registry read', async () => {
+  const { client, root } = failingRuntimeFixture();
+  const list = client.debug.location.list;
+  let reads = 0;
+  client.debug.location.list = async () => {
+    if (reads++) throw new Error('registry unavailable during reconciliation');
+    return list();
+  };
+  await assert.rejects(loadTask(client, root.id), /registry unavailable during reconciliation/);
+});
+
+test('cancellation cannot be mistaken for an absent runtime', async () => {
+  const { client, root, retired } = failingRuntimeFixture();
+  const controller = new AbortController();
+  const forms = client.session.form.list;
+  client.session.form.list = async (input) => {
+    if (input.sessionID === retired.id) controller.abort();
+    return forms(input);
+  };
+  await assert.rejects(loadTask(client, root.id, { signal: controller.signal }), { name: 'AbortError' });
+});
+
+test('an unrelated active root can retain this task\'s detached location runtime', async (t) => {
+  for (const phase of ['initially absent', 'failed replacement']) {
+    await t.test(phase, async () => {
+      const { client, root, retired, live } = failingRuntimeFixture();
+      // The unrelated root is active in /elsewhere. The retired child used the
+      // same graph; that graph can still own its background commands after detach.
+      retired.location.directory = '/elsewhere';
+      client.session.active = async () => ({ ses_other_root: { type: 'running' } });
+      if (phase === 'initially absent') client.debug.location.list = async () => live;
+      await assert.rejects(loadTask(client, root.id));
+    });
+  }
+});

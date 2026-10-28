@@ -125,35 +125,64 @@ export async function loadTask(client, sessionID, { signal = AbortSignal.timeout
   const sessions = [...tree.values()];
   // Forms, permissions and shells belong to live location services. Asking an
   // old session for them boots its location again, which fails after a temporary
-  // worktree was removed. The server's registry proves which volatile stores
-  // exist; persisted child history and inboxes must still be read for every node.
+  // worktree was removed. The registry bounds possible stores, but also includes
+  // in-flight builds. Persisted history and inboxes are still read for every node.
   const runtimeBefore = await runtimeDirectories();
   const hasRuntime = (session) => runtimeBefore.has(session.location.directory);
-  if (sessions.some((session) => Object.hasOwn(activeMap, session.id) && !hasRuntime(session))) {
+  const directories = new Set(sessions.map((session) => session.location.directory));
+  const excluded = new Set([...directories].filter((directory) => !runtimeBefore.has(directory)));
+  // An unrelated active root can retain a detached shared graph that still
+  // owns this task's background work. Ownership checks must be process-wide,
+  // even though classification and activity counts remain task-scoped.
+  const activeOwner = (directory, activity) => Object.keys(activity).some((id) => known.get(id)?.location.directory === directory);
+  const failures = new Map();
+  const observed = new Set();
+  async function readRuntime(directory, read) {
+    // Settle every issued read before checking whether a failed build was
+    // evicted. One sibling request may otherwise still be acquiring the store.
+    const [result] = await Promise.allSettled([Promise.resolve().then(read)]);
+    if (result.status === 'rejected') failures.set(directory, result.reason);
+    else observed.add(directory);
+    return result;
+  }
+  if ([...excluded].some((directory) => activeOwner(directory, activeMap))) {
     throw new Error('Active task location is unavailable');
   }
   const records = await mapBounded(sessions, async (session) => {
     const input = { sessionID: session.id };
-    const [inbox, forms, permissions] = await Promise.all([
+    const directory = session.location.directory;
+    const [inbox, reads] = await Promise.all([
       client.session.inbox.list(input, request),
-      hasRuntime(session) ? client.session.form.list(input, request) : [],
-      hasRuntime(session) ? client.permission.list(input, request) : [],
+      hasRuntime(session) ? Promise.all([
+        readRuntime(directory, () => client.session.form.list(input, request)),
+        readRuntime(directory, () => client.permission.list(input, request)),
+      ]) : [],
     ]);
-    return { inbox, forms, permissions };
+    return { inbox, forms: reads[0]?.status === 'fulfilled' ? reads[0].value : [],
+      permissions: reads[1]?.status === 'fulfilled' ? reads[1].value : [] };
   });
-  const [messages, locations, activeNow] = await Promise.all([
+  const [messages, locations] = await Promise.all([
     client.message.list({ sessionID: root.id, type: 'assistant', order: 'desc', limit: 1 }, request),
-    mapBounded([...new Set(sessions.filter(hasRuntime).map((session) => session.location.directory))],
-      async (directory) => client.shell.list({ location: { directory } }, request)),
-    client.session.active(request),
+    mapBounded([...directories].filter((directory) => runtimeBefore.has(directory)),
+      (directory) => readRuntime(directory, () => client.shell.list({ location: { directory } }, request))),
   ]);
-  // If execution started during the snapshot, refuse to publish an idle result.
-  if (Object.keys(activeNow).some((id) => !Object.hasOwn(activeMap, id))) throw new Error('Activity changed during snapshot');
-  const runtimeAfter = await runtimeDirectories();
-  if (sessions.some((session) => !hasRuntime(session) && runtimeAfter.has(session.location.directory))) {
-    throw new Error('Task runtime locations changed during snapshot');
+  signal.throwIfAborted();
+  if (failures.size) {
+    const [registered, activity] = await Promise.all([runtimeDirectories(), client.session.active(request)]);
+    signal.throwIfAborted();
+    if (Object.keys(activity).some((id) => !Object.hasOwn(activeMap, id))) throw new Error('Activity changed during snapshot');
+    for (const [directory, error] of failures) {
+      const unresolvedShell = knownShells.some((shell) => tree.has(shell.metadata?.sessionID) && shell.status === 'running' &&
+        (shell.location || tree.get(shell.metadata.sessionID).location).directory === directory);
+      // Only successful absence reads can retire a failed acquisition. HTTP
+      // failure alone, mixed success, or owned work never means an empty store.
+      if (registered.has(directory) || observed.has(directory) || activeOwner(directory, activeMap) ||
+          activeOwner(directory, activity) || unresolvedShell) throw error;
+      excluded.add(directory);
+    }
   }
-  const shells = new Map(locations.flatMap((result) => result.data.map((shell) => ({ ...shell, location: result.location })))
+  const shells = new Map(locations.filter((result) => result.status === 'fulfilled')
+    .flatMap(({ value }) => value.data.map((shell) => ({ ...shell, location: value.location })))
     .filter((shell) => tree.has(shell.metadata?.sessionID)).map((shell) => [shell.id, shell]));
   // shell.list is running-only. Refetch disappeared commands by their original
   // location so an SSE disconnect or session move cannot erase their finish time.
@@ -163,6 +192,12 @@ export async function loadTask(client, sessionID, { signal = AbortSignal.timeout
     const result = await client.shell.get({ id: shell.id, location }, request);
     shells.set(shell.id, { ...result.data, location: result.location });
   });
+  const [runtimeAfter, activeNow] = await Promise.all([runtimeDirectories(), client.session.active(request)]);
+  signal.throwIfAborted();
+  // Recheck after all volatile and known-shell reads, including newly retired
+  // failed builds. Activity or a replacement store invalidates absence evidence.
+  if (Object.keys(activeNow).some((id) => !Object.hasOwn(activeMap, id))) throw new Error('Activity changed during snapshot');
+  if ([...excluded].some((directory) => runtimeAfter.has(directory))) throw new Error('Task runtime locations changed during snapshot');
   return {
     root, sessions, active: Object.keys(activeNow).filter((id) => tree.has(id)),
     inbox: records.flatMap((record) => record.inbox), forms: records.flatMap((record) => record.forms),
