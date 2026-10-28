@@ -111,8 +111,13 @@ export default {
         // This deadline must run independently of RPC/event/retry timing. A
         // busy stream cannot keep an old result trusted by racing every reply.
         selection.freshnessTimer = setTimeout(() => {
-          if (!isCurrent()) return;
+          if (selection.refreshing !== token) return;
+          // Expiry remains true even if navigation temporarily fences delivery.
+          // Returning before the route poll must not revive that old confidence.
+          token.expired = true;
+          selection.freshnessTimer = undefined;
           selection.confirmed = undefined;
+          if (!isCurrent()) return;
           void reporter.report({ rootID: selection.rootID, state: "unknown", reason: "snapshot-unavailable" }, {
             signal: selection.controller.signal, isCurrent,
           }).catch(() => false);
@@ -121,7 +126,9 @@ export default {
       }
       // Preserve bootstrap coalescing for a locally raced first reply. An
       // explicit unavailable result or an uncertain prior delivery needs Unknown now.
-      if (!selection.confirmed && (selection.rootID || explicitRefreshing)) throw new Error("Lifecycle snapshot is not current");
+      if (!selection.confirmed && (selection.rootID || explicitRefreshing || selection.refreshing.expired)) {
+        throw new Error("Lifecycle snapshot is not current");
+      }
     }
 
     function schedule(selection, delay = 20) {

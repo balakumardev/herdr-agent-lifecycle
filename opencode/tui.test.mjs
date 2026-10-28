@@ -50,10 +50,10 @@ async function socketFixture(t, reply) {
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(path, resolve); });
   t.after(async () => {
     for (const socket of sockets) socket.destroy();
-    await new Promise((resolve) => server.close(resolve));
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
     await rm(directory, { recursive: true, force: true });
   });
-  return { reports, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: path, HERDR_PANE_ID: "pane-test" } };
+  return { reports, server, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: path, HERDR_PANE_ID: "pane-test" } };
 }
 
 function host(overrides = {}) {
@@ -203,7 +203,7 @@ test("an unrelated server event cannot reannounce the same completed result to H
 });
 
 test("refreshing snapshots preserve completion attention and retry promptly", async (t) => {
-  // Accept both generations during a live upgrade: v1.0.2 called this Working.
+  // The refresh reason takes precedence over its wire state value.
   for (const state of ["working", "unknown"]) await t.test(state, async (t) => {
     const { reports, env } = await socketFixture(t);
     const completed = snapshot({ state: "idle", complete: true, activeCount: 0, reason: "done", completionKey: "done:ses_root:msg_final" });
@@ -290,6 +290,73 @@ test("navigation cancels a pending freshness deadline", async (t) => {
   ui.emit("session.execution.started");
   await delay(100);
   assert.deepEqual(states(reports), [["ses_root", "idle"]]);
+});
+
+test("brief navigation at expiry cannot leave an exhausted freshness deadline trusted", async (t) => {
+  const { reports, env } = await socketFixture(t);
+  const ui = host({ response: snapshot({ state: "idle", complete: true, reason: "done", activeCount: 0 }),
+    options: { pollIntervalMs: 60_000, requestTimeoutMs: 200, retryIntervalMs: 20 } });
+  const away = deferred();
+  const held = deferred();
+  const currentRoute = ui.api.ui.router.current;
+  ui.api.ui.router.current = () => {
+    if (ui.state.route.type === "home") away.resolve();
+    return currentRoute();
+  };
+  start(t, ui, env);
+  await until(() => reports.length === 1, "initial completion");
+  // Let the real socket acknowledgement settle, then arrange an RPC spanning
+  // expiry so only the deadline observes the brief navigation away and back.
+  await delay(10);
+  let reads = 0;
+  ui.state.resolve = () => {
+    reads++;
+    return reads === 1 ? Promise.resolve(snapshot({ reason: "refreshing", activeCount: 0 })) : held.promise;
+  };
+  ui.emit("session.execution.started");
+  await until(() => reads === 1, "freshness deadline armed");
+  ui.emit("session.execution.started");
+  await until(() => reads === 2, "second RPC spans expiry");
+  ui.state.route = { type: "home" };
+  await Promise.race([away.promise, delay(1_000).then(() => { throw new Error("Deadline never checked navigation"); })]);
+  assert.deepEqual(states(reports), [["ses_root", "idle"]], "an obsolete selection must not report at expiry");
+  ui.state.route = { type: "session", sessionID: "ses_root" };
+  ui.state.resolve = () => {
+    reads++;
+    ui.emit("session.execution.started");
+    return Promise.resolve(snapshot({ reason: "refreshing", activeCount: 0 }));
+  };
+  held.resolve(snapshot({ reason: "refreshing", activeCount: 0 }));
+  ui.emit("session.execution.started");
+  await until(() => reports.some(({ params }) => params.state === "unknown"), "returning to the same selection cannot revive expired confidence");
+  assert.deepEqual(states(reports), [["ses_root", "idle"], ["ses_root", "unknown"]]);
+});
+
+test("bootstrap uncertainty retries Unknown after a failed deadline delivery", async (t) => {
+  for (const mode of ["socket unavailable", "malformed acknowledgement"]) await t.test(mode, async (t) => {
+    let accepting = false;
+    const { reports, server, env } = await socketFixture(t, request => accepting ? undefined : { id: request.id });
+    if (mode === "socket unavailable") await new Promise(resolve => server.close(resolve));
+    const ui = host({ options: { requestTimeoutMs: 60, retryIntervalMs: 20 } });
+    ui.state.resolve = () => {
+      ui.emit("session.execution.started", { sessionID: "ses_child" });
+      return Promise.resolve(snapshot());
+    };
+    start(t, ui, env);
+    await until(() => ui.calls.length >= 9, "deadline expired while every bootstrap read was invalidated");
+    if (mode === "malformed acknowledgement") assert.ok(reports.length > 0, "the first Unknown reached a rejecting receiver");
+    const attempts = reports.length;
+    accepting = true;
+    if (!server.listening) await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(env.HERDR_SOCKET_PATH, resolve);
+    });
+    await until(() => reports.length > attempts, "Unknown retried after transport recovery without an authoritative snapshot");
+    assert.ok(reports.every(({ params }) => params.state === "unknown" && params.agent_session_id === undefined));
+    ui.state.resolve = undefined;
+    await until(() => reports.at(-1).params.state === "working", "a fresh real snapshot still recovers the pane");
+    assert.equal(reports.at(-1).params.agent_session_id, "ses_root");
+  });
 });
 
 test("a failed first snapshot claims unknown state without inventing a root session", async (t) => {
