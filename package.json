@@ -1,6 +1,6 @@
 {
   "name": "herdr-agent-lifecycle",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "description": "Task-aware Herdr completion reporting for Claude Code and OpenCode",

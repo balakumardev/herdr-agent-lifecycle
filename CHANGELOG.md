@@ -1,3 +1,9 @@
+## [1.0.2](https://github.com/balakumardev/herdr-agent-lifecycle/compare/v1.0.1...v1.0.2) (2026-10-28)
+
+### Fixes
+
+* **opencode:** preserve task state across retired worktrees ([5f98d08](https://github.com/balakumardev/herdr-agent-lifecycle/commit/5f98d08b376454d545237cadce6413bf0395f36b))
+
 ## [1.0.1](https://github.com/balakumardev/herdr-agent-lifecycle/compare/v1.0.0...v1.0.1) (2026-10-28)
 
 ### Maintenance
