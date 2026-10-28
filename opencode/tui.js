@@ -129,6 +129,10 @@ export default {
         // follow-up rather than publishing an obsolete completion or question.
         if (fresh()) {
           if (!validSnapshot(snapshot)) throw new Error("Invalid lifecycle snapshot");
+          selection.rootID = snapshot.rootID;
+          // A send can reach Herdr even if its acknowledgement is lost or raced
+          // by new work. The older state no longer proves what the pane shows.
+          selection.confirmed = undefined;
           acknowledged = await reporter.report(snapshot, {
             signal: selection.controller.signal,
             isCurrent: fresh,
@@ -140,10 +144,12 @@ export default {
         // stale idle report also hides new background work. Neither is evidence
         // of completion. Preserve known working/blocked states, otherwise claim
         // unknown until the next authoritative read, without inventing ancestry.
-        if (fresh() && (!selection.confirmed || selection.confirmed.state === "idle")) {
-          await reporter.report({ rootID: selection.confirmed?.rootID, state: "unknown", reason: "snapshot-unavailable" }, {
+        if (current(selection) && (!selection.confirmed || selection.confirmed.state === "idle")) {
+          await reporter.report({ rootID: selection.rootID, state: "unknown", reason: "snapshot-unavailable" }, {
             signal: selection.controller.signal,
-            isCurrent: fresh,
+            // New work invalidates a successful snapshot, but cannot turn a
+            // failed read into evidence for retaining Idle. Navigation still fences it.
+            isCurrent: () => current(selection),
           }).catch(() => false);
         }
       } finally {

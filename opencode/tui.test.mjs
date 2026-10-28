@@ -218,6 +218,56 @@ test("a failed or malformed refresh cannot leave a previously completed pane idl
   }
 });
 
+test("lifecycle traffic during failed snapshots cannot suppress Unknown", async (t) => {
+  for (const initialIdle of [false, true]) {
+    await t.test(initialIdle ? "after confirmed Idle" : "before the first report", async (t) => {
+      const { reports, env } = await socketFixture(t);
+      const ui = host({ options: { refreshIntervalMs: 20 },
+        response: snapshot({ state: "idle", complete: true, activeCount: 0, reason: "done" }) });
+      const fail = () => {
+        ui.emit("session.execution.started", { sessionID: "ses_child" });
+        return Promise.reject(new Error("runtime unavailable"));
+      };
+      if (!initialIdle) ui.state.resolve = fail;
+      start(t, ui, env);
+      if (initialIdle) {
+        await until(() => ui.calls.length >= 2, "initial report acknowledged before the outage");
+        ui.state.resolve = fail;
+        ui.emit("session.execution.started", { sessionID: "ses_child" });
+      }
+      await until(() => reports.some(({ params }) => params.state === "unknown"), "Unknown despite an event during every failed read");
+      assert.deepEqual(states(reports), initialIdle ? [["ses_root", "idle"], ["ses_root", "unknown"]] : [[undefined, "unknown"]]);
+      ui.state.resolve = undefined;
+      ui.state.response = snapshot();
+      await until(() => reports.at(-1).params.state === "working", "authoritative recovery");
+    });
+  }
+});
+
+test("an uncertain Idle delivery invalidates older Working confirmation", async (t) => {
+  for (const mode of ["malformed acknowledgement", "acknowledgement raced by new work"]) {
+    await t.test(mode, async (t) => {
+      let ui;
+      const { reports, env } = await socketFixture(t, (request) => {
+        if (request.params.state !== "idle") return;
+        // The receiver has accepted Idle, but the caller cannot rely on its ack.
+        ui.state.resolve = () => Promise.reject(new Error("snapshot unavailable"));
+        if (mode === "malformed acknowledgement") return { id: request.id };
+        ui.emit("session.execution.started", { sessionID: "ses_child" });
+        return { id: request.id, result: { type: "ok" } };
+      });
+      ui = host({ options: { refreshIntervalMs: 20 } });
+      start(t, ui, env);
+      await until(() => ui.calls.length >= 2, "Working acknowledged before the completion attempt");
+      ui.state.response = snapshot({ state: "idle", complete: true, activeCount: 0, reason: "done" });
+      ui.emit("session.execution.succeeded");
+      await until(() => reports.some(({ params }) => params.state === "unknown"), "possibly delivered Idle retracted after snapshot failure");
+      assert.deepEqual(states(reports), [["ses_root", "working"], ["ses_root", "idle"], ["ses_root", "unknown"]]);
+      assert.deepEqual(reports.at(-1).params.resume_argv, ["opencode", "--session", "ses_root"]);
+    });
+  }
+});
+
 test("selection polling and periodic snapshots recover navigation and lost lifecycle events", async (t) => {
   const { reports, env } = await socketFixture(t);
   const ui = host({ options: { refreshIntervalMs: 60 } });
