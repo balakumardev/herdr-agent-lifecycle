@@ -17,7 +17,7 @@ function duration(value, fallback) {
 
 function validSnapshot(value) {
   return value && typeof value.rootID === "string" && value.rootID.length > 0 &&
-    ["working", "blocked", "idle"].includes(value.state) && typeof value.complete === "boolean" &&
+    ["working", "blocked", "idle", "unknown"].includes(value.state) && typeof value.complete === "boolean" &&
     typeof value.reason === "string" && typeof value.title === "string" &&
     Number.isInteger(value.activeCount) && value.activeCount >= 0 &&
     Number.isInteger(value.pendingCount) && value.pendingCount >= 0 &&
@@ -94,7 +94,34 @@ export default {
     function retire(selection) {
       if (!selection) return;
       clearTimeout(selection.timer);
+      clearFreshness(selection);
       selection.controller.abort();
+    }
+
+    function clearFreshness(selection) {
+      clearTimeout(selection.freshnessTimer);
+      selection.freshnessTimer = undefined;
+      selection.refreshing = undefined;
+    }
+
+    function deferSnapshot(selection, explicitRefreshing) {
+      if (!selection.refreshing) {
+        const token = selection.refreshing = {};
+        const isCurrent = () => current(selection) && selection.refreshing === token;
+        // This deadline must run independently of RPC/event/retry timing. A
+        // busy stream cannot keep an old result trusted by racing every reply.
+        selection.freshnessTimer = setTimeout(() => {
+          if (!isCurrent()) return;
+          selection.confirmed = undefined;
+          void reporter.report({ rootID: selection.rootID, state: "unknown", reason: "snapshot-unavailable" }, {
+            signal: selection.controller.signal, isCurrent,
+          }).catch(() => false);
+        }, requestMs);
+        selection.freshnessTimer.unref?.();
+      }
+      // Preserve bootstrap coalescing for a locally raced first reply. An
+      // explicit unavailable result or an uncertain prior delivery needs Unknown now.
+      if (!selection.confirmed && (selection.rootID || explicitRefreshing)) throw new Error("Lifecycle snapshot is not current");
     }
 
     function schedule(selection, delay = 20) {
@@ -126,9 +153,15 @@ export default {
       try {
         const snapshot = await requestSnapshot(api, selection, requestMs);
         if (!validSnapshot(snapshot)) throw new Error("Invalid lifecycle snapshot");
-        // Events arriving during a read can invalidate that read. Coalesce one
-        // follow-up rather than publishing an obsolete completion or question.
+        // Bookkeeping is not an agent state change: synthetic Working would
+        // reannounce a completion, while Unknown would erase unread attention.
+        // Briefly retain a confirmed report while retrying either kind of race.
+        if (current(selection) && (!fresh() || snapshot.reason === "refreshing")) {
+          deferSnapshot(selection, snapshot.reason === "refreshing");
+          return;
+        }
         if (fresh()) {
+          clearFreshness(selection);
           selection.rootID = snapshot.rootID;
           // A send can reach Herdr even if its acknowledgement is lost or raced
           // by new work. The older state no longer proves what the pane shows.

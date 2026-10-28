@@ -6,8 +6,9 @@ Native V2 session-tree state for Herdr and optional ntfy on macOS and Linux.
 
 - **Working:** the root or any descendant is running, an inbox has queued work, an owned shell is running, or a descendant has finished but the parent has not yet produced its final response.
 - **Blocked:** a user form or permission is pending, or root execution failed/interrupted. Only pending user forms produce blocked **ntfy** alerts.
-- **Done:** a successful root execution has a completed, final (`stop`) assistant response after its descendants settled, with no pending work. Herdr receives `idle`; ntfy receives one completion notification.
+- **Done / Idle:** a successful root execution has a completed, final (`stop`) assistant response after its descendants settled, with no pending work. Herdr receives `idle` and shows **Done** while the completion is unread, then **Idle** after it is viewed; ntfy receives one completion notification. Refreshing the same result preserves its read/unread status.
 - **Unknown:** the first snapshot could not be read, or a failed refresh made an earlier Idle report untrustworthy. The custom reporter claims the pane and retries, so screen detection cannot mistake invisible background work for completion. A confirmed Working or Blocked report is retained only when no later status delivery made that confirmation uncertain. New lifecycle events cannot suppress Unknown; navigation and disposal still prevent obsolete reports.
+- Lifecycle changes with known ownership and location invalidate their own task tree and tasks depending on a shared runtime directory, including newly created children and background-shell cleanup. Reconnection or unresolved ancestry/location still invalidates all potentially affected reads. `reason: refreshing` means the read is unavailable, not that an execution started. Its legacy wire value remains `state: working` because older location RPC registrations survive a shared-monitor upgrade. The TUI checks the reason first and retries without changing an established Herdr state. An independent `requestTimeoutMs` freshness deadline (5 seconds by default) bounds that grace period, even when events keep invalidating replies or retries are slower. Missing initial confidence or an expired deadline reports Unknown. This avoids both reannouncing read completions and erasing unread ones during a brief refresh.
 - The completion body is the text of that newest root assistant response, read by the existing root-only `message.list` query (`type: assistant`, descending, limit 1). Reasoning and tool parts are excluded; older answers and child messages are never substitutes. Multiple text parts are separated by blank lines. Bodies over 4000 UTF-8 bytes are truncated at a code-point boundary with `…` included in that budget.
 - If the final body is missing or unreadable, completion stays unconfirmed and is retried through normal reconciliation. There is no boilerplate fallback. Message text goes only to the notifier, never to the public snapshot RPC, snapshot cache, or persistent receipts/deduplication records.
 - Opening an already completed session does not replay historical completion alerts.
@@ -65,7 +66,7 @@ defaults to `opencode` and is configurable through `opencode.command` in the
 opencode api post '/api/rpc/local.task-lifecycle/health' --data '{"input":{}}'
 opencode api post '/api/rpc/local.task-lifecycle/snapshot' \
   --data '{"input":{"sessionID":"<sessionID>"}}'
-herdr agent explain '<paneID>' --json
+herdr agent get '<paneID>'
 ```
 
 Notifications use the shared settings file and are disabled by default. Receipts

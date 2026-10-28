@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { classifyTask, loadTask } from './lifecycle.mjs';
+import { TaskMonitor } from './monitor.mjs';
 
 function snapshot(overrides = {}) {
   const root = { id: 'ses_root', title: 'Example task', outcome: 'succeeded', time: { created: 1, idle: 100 }, location: { directory: '/project' } };
@@ -204,6 +205,53 @@ function retiredLocationFixture() {
   client.shell.list = async ({ location }) => location.directory === retired.location.directory ? unavailable() : { data: [], location };
   return { client, root, retired };
 }
+
+test('shared runtime ownership invalidates cached completion and notification admission', async () => {
+  const { client, root, retired } = retiredLocationFixture();
+  root.time.idle = 200;
+  let active = {};
+  client.session.active = async () => active;
+  client.message.list = async () => ({ data: [{ ...snapshot().lastAssistant, time: { completed: 199 } }] });
+  const get = client.session.get;
+  client.session.get = async (input) => input.sessionID === 'ses_other_root'
+    ? { ...await get(input), location: retired.location } : get(input);
+  let current;
+  let finish;
+  const waiting = new Promise(resolve => { finish = resolve; });
+  const monitor = new TaskMonitor({ load: (id, options) => loadTask(client, id, options), notifier: { publish: async (_message, options) => {
+    current = options.isCurrent;
+    await waiting;
+    return { status: current() ? 'sent' : 'cancelled' };
+  } } });
+  monitor.observe({ type: 'session.created', data: { sessionID: 'ses_other_root', location: retired.location } });
+  monitor.observe({ type: 'session.execution.succeeded', data: { sessionID: root.id } });
+  assert.equal((await monitor.inspect(root.id)).complete, true);
+  try {
+    active = { ses_other_root: { type: 'running' } };
+    monitor.observe({ type: 'session.execution.started', data: { sessionID: 'ses_other_root' }, location: retired.location });
+    assert.equal(current(), false, 'another root sharing the retired runtime revokes its absence proof');
+    await assert.rejects(monitor.inspect(root.id), /Active task location is unavailable/,
+      'an old cached Idle must not bypass the runtime ownership check');
+  } finally { finish(); await Promise.all([...monitor.publishing.values()]); }
+});
+
+test('a shared-runtime owner appearing during a read invalidates the completed result', async () => {
+  const { client, root, retired } = retiredLocationFixture();
+  root.time.idle = 200;
+  client.session.active = async () => ({});
+  client.message.list = async () => ({ data: [{ ...snapshot().lastAssistant, time: { completed: 199 } }] });
+  const loaded = await loadTask(client, root.id);
+  let release;
+  const monitor = new TaskMonitor({ load: () => new Promise(resolve => { release = resolve; }),
+    notifier: { publish: async () => ({ status: 'disabled' }) } });
+  monitor.observe({ type: 'session.created', data: { sessionID: 'ses_other_root', location: retired.location } });
+  const pending = monitor.inspect(root.id);
+  monitor.observe({ type: 'session.execution.started', data: { sessionID: 'ses_other_root' }, location: retired.location });
+  release(loaded);
+  const result = await pending;
+  assert.equal(result.complete, false);
+  assert.equal(result.reason, 'refreshing');
+});
 
 test('a retired worktree cannot hide live descendants or erase the parent continuation barrier', async () => {
   const { client, root } = retiredLocationFixture();

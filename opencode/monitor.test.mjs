@@ -337,6 +337,88 @@ test('a new prompt while snapshot reads are in flight invalidates a would-be Don
   assert.equal(published.length, 0);
 });
 
+test('another task cannot manufacture a work cycle for an unchanged completed task', async (t) => {
+  for (const [name, setup, change] of [
+    ['root execution', [], { type: 'session.execution.started', data: { sessionID: 'ses_other' } }],
+    ['new root', [], { type: 'session.created', data: { sessionID: 'ses_new_root', location: { directory: '/elsewhere' } } }],
+    ['nested execution', [{ type: 'session.created', data: { sessionID: 'ses_other_child', parentID: 'ses_other', location: { directory: '/elsewhere' } } }],
+      { type: 'session.execution.started', data: { sessionID: 'ses_other_child' } }],
+    ['shell exit', [{ type: 'shell.created', data: { info: { id: 'sh_other', metadata: { sessionID: 'ses_other' } } } }],
+      { type: 'shell.exited', data: { id: 'sh_other', status: 'exited' } }],
+    ['shell cleanup', [
+      { type: 'shell.created', data: { info: { id: 'sh_other', metadata: { sessionID: 'ses_other' } } } },
+      { type: 'shell.exited', data: { id: 'sh_other', status: 'exited' } },
+    ], { type: 'shell.deleted', data: { id: 'sh_other' } }],
+  ]) await t.test(name, async () => {
+    const { monitor, snapshot, published } = fixture();
+    const before = await monitor.inspect('ses_root');
+    monitor.observe({ type: 'session.created', data: { sessionID: 'ses_other', location: { directory: '/elsewhere' } } });
+    for (const event of setup) monitor.observe(event);
+    let release;
+    monitor.load = () => new Promise(resolve => { release = resolve; });
+    const pending = monitor.inspect('ses_root', true);
+    monitor.observe(change);
+    release(structuredClone(snapshot));
+    const during = await pending;
+    monitor.load = async () => structuredClone(snapshot);
+    const after = await monitor.inspect('ses_root', true);
+    assert.deepEqual([before, during, after].map(({ state, complete, completionKey }) => ({ state, complete, completionKey })), [
+      { state: 'idle', complete: true, completionKey: 'done:ses_root:msg_final' },
+      { state: 'idle', complete: true, completionKey: 'done:ses_root:msg_final' },
+      { state: 'idle', complete: true, completionKey: 'done:ses_root:msg_final' },
+    ]);
+    assert.equal(published.length, 0, 'historical completion stays silent');
+  });
+});
+
+test('an invalidated snapshot is uncertainty, never evidence of an execution', async (t) => {
+  for (const [name, change] of [
+    ['new descendant missing from the read', { type: 'session.created', data: { sessionID: 'ses_new_child', parentID: 'ses_root' } }],
+    ['unresolved session ancestry', { type: 'session.execution.started', data: { sessionID: 'ses_unresolved' } }],
+    ['reconnection', { type: 'server.connected' }],
+  ]) await t.test(name, async () => {
+    const { monitor, snapshot, published } = fixture();
+    await monitor.inspect('ses_root');
+    let release;
+    monitor.load = () => new Promise(resolve => { release = resolve; });
+    const pending = monitor.inspect('ses_root', true);
+    monitor.observe(change);
+    release(structuredClone(snapshot));
+    const result = await pending;
+    assert.equal(result.state, 'working', 'retain the legacy RPC enum; refreshing is not an execution report');
+    assert.equal(result.reason, 'refreshing');
+    assert.equal(result.complete, false);
+    assert.equal(result.completionKey, undefined);
+    assert.equal(published.length, 0);
+    snapshot.sessions.push({ id: 'ses_new_child', parentID: 'ses_root', time: { created: 110 } });
+    snapshot.active = ['ses_new_child'];
+    monitor.load = async () => structuredClone(snapshot);
+    assert.equal((await monitor.inspect('ses_root')).state, 'working', 'real child activity is still reported');
+  });
+});
+
+test('unrelated task activity cannot revoke a valid notification admission', async () => {
+  const { snapshot, event } = fixture();
+  let current;
+  let finish;
+  const waiting = new Promise(resolve => { finish = resolve; });
+  const monitor = new TaskMonitor({ load: async () => structuredClone(snapshot), notifier: { publish: async (_message, options) => {
+    current = options.isCurrent;
+    await waiting;
+    return { status: current() ? 'sent' : 'cancelled' };
+  } } });
+  monitor.observe({ type: 'session.created', data: { sessionID: 'ses_other', location: { directory: '/elsewhere' } } });
+  monitor.observe(event('session.execution.succeeded', { sessionID: 'ses_root' }));
+  await monitor.inspect('ses_root');
+  try {
+    assert.equal(current(), true);
+    monitor.observe(event('session.execution.started', { sessionID: 'ses_other' }));
+    assert.equal(current(), true, 'another root does not invalidate this completion');
+    monitor.observe(event('session.inbox.enqueued', { sessionID: 'ses_root' }));
+    assert.equal(current(), false, 'new work for this root still revokes the completion');
+  } finally { finish(); await delivered(monitor); }
+});
+
 test('failed notification attempts can retry instead of being marked delivered', async () => {
   const { snapshot, event } = fixture();
   const attempts = [];
