@@ -7,10 +7,12 @@ Native V2 session-tree state for Herdr and optional ntfy on macOS and Linux.
 - **Working:** the root or any descendant is running, an inbox has queued work, an owned shell is running, or a descendant has finished but the parent has not yet produced its final response.
 - **Blocked:** a user form or permission is pending, or root execution failed/interrupted. Only pending user forms produce blocked **ntfy** alerts.
 - **Done:** a successful root execution has a completed, final (`stop`) assistant response after its descendants settled, with no pending work. Herdr receives `idle`; ntfy receives one completion notification.
+- **Unknown:** the first snapshot could not be read, or a failed refresh made an earlier Idle report untrustworthy. The custom reporter claims the pane and retries, so screen detection cannot mistake invisible background work for completion. A previously confirmed Working or Blocked report is retained during a failed refresh.
 - The completion body is the text of that newest root assistant response, read by the existing root-only `message.list` query (`type: assistant`, descending, limit 1). Reasoning and tool parts are excluded; older answers and child messages are never substitutes. Multiple text parts are separated by blank lines. Bodies over 4000 UTF-8 bytes are truncated at a code-point boundary with `…` included in that budget.
 - If the final body is missing or unreadable, completion stays unconfirmed and is retried through normal reconciliation. There is no boilerplate fallback. Message text goes only to the notifier, never to the public snapshot RPC, snapshot cache, or persistent receipts/deduplication records.
 - Opening an already completed session does not replay historical completion alerts.
 - Descendants can live in different directories/worktrees. The pane remains attributed to its root.
+- Completed children remain part of the task after their temporary worktrees are removed. Persisted history and queued input are read for every child; forms, permissions and shells are read only from locations in OpenCode's live runtime registry. Registry failures, missing active-child runtimes and locations appearing during the read prevent completion and trigger a fresh snapshot.
 
 ### Delivery retries
 
@@ -83,7 +85,7 @@ local HTTP servers, including the packaged legacy-bridge fixture.
 
 ## Applying source updates on the shared service
 
-[V2 plugin configuration](https://opencode.ai/v2/docs/plugins#reload) supports automatic reloads for watched configuration directories. This package keeps its monitor in a process-global, reference-counted singleton (`index.js`). Version 1.0.2 adds a versioned handoff: the first setup from a newer build aborts the old event subscription, replaces the monitor and retains pending observation metadata and retry deadlines. Old in-flight admissions are invalidated. Other location references keep using the replacement.
+[V2 plugin configuration](https://opencode.ai/v2/docs/plugins#reload) supports automatic reloads for watched configuration directories. This package keeps its monitor in a process-global, reference-counted singleton (`index.js`). Upgrades use a versioned handoff: the first setup from a newer build aborts the old event subscription, replaces the monitor and retains pending observation metadata and retry deadlines. Old in-flight admissions are invalidated. Other location references keep using the replacement.
 
 After updating source, trigger a watched plugin-config reload and verify `local.task-lifecycle/health` reports the new version, then check a real diagnostic completion. Editing an unwatched imported file alone is not proof of activation. If a restart is used instead, schedule it after active work finishes. Startup hydration continues to suppress historical completion alerts.
 

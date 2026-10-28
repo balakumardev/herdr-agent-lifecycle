@@ -182,6 +182,42 @@ test("failed and malformed snapshots preserve the previous report and recover on
   assert.deepEqual(states(reports), [["ses_root", "working"], ["ses_root", "blocked"]]);
 });
 
+test("a failed first snapshot claims unknown state without inventing a root session", async (t) => {
+  const { reports, env } = await socketFixture(t);
+  const ui = host({ resolve: () => Promise.reject(new Error("retired worktree unavailable")) });
+  start(t, ui, env);
+  await until(() => reports.length === 1, "unknown report instead of screen-detected idle");
+  assert.equal(reports[0].params.state, "unknown");
+  assert.equal(reports[0].params.agent, "opencode-v2");
+  assert.equal(reports[0].params.source, "custom:opencode-v2-lifecycle");
+  assert.equal(reports[0].params.agent_session_id, undefined);
+  assert.equal(reports[0].params.resume_argv, undefined);
+  ui.state.resolve = undefined;
+  await until(() => reports.length === 2, "authoritative recovery");
+  assert.deepEqual(states(reports), [[undefined, "unknown"], ["ses_root", "working"]]);
+  assert.deepEqual(reports[1].params.resume_argv, ["opencode", "--session", "ses_root"]);
+});
+
+test("a failed or malformed refresh cannot leave a previously completed pane idle", async (t) => {
+  for (const [name, failure] of [["RPC failure", () => Promise.reject(new Error("server disconnected"))],
+    ["malformed snapshot", () => Promise.resolve({ rootID: "ses_root", state: "idle" })]]) {
+    await t.test(name, async (t) => {
+      const { reports, env } = await socketFixture(t);
+      const ui = host({ response: snapshot({ state: "idle", complete: true, activeCount: 0, reason: "done" }) });
+      start(t, ui, env);
+      await until(() => reports.length === 1, "confirmed completion");
+      ui.state.resolve = failure;
+      ui.emit("session.execution.started", { sessionID: "ses_child" });
+      await until(() => reports.length === 2, "incomplete read retracts idle");
+      assert.deepEqual(states(reports), [["ses_root", "idle"], ["ses_root", "unknown"]]);
+      ui.state.resolve = undefined;
+      ui.state.response = snapshot();
+      await until(() => reports.length === 3, "live descendants recovered");
+      assert.equal(reports[2].params.state, "working");
+    });
+  }
+});
+
 test("selection polling and periodic snapshots recover navigation and lost lifecycle events", async (t) => {
   const { reports, env } = await socketFixture(t);
   const ui = host({ options: { refreshIntervalMs: 60 } });
@@ -345,11 +381,13 @@ test("an unresponsive RPC is bounded and retried without accepting its late resp
     return Promise.resolve(snapshot());
   } });
   start(t, ui, env);
-  await until(() => reports.length === 1, "retry after timeout");
+  await until(() => reports.length === 2, "unknown followed by successful retry after timeout");
   assert.equal(ui.calls[0].options.signal.aborted, true);
   pending.resolve(snapshot({ state: "idle", complete: true, reason: "done" }));
   await delay(50);
-  assert.deepEqual(states(reports), [["ses_root", "working"]]);
+  // The timed-out read is now visibly unknown, then recovery is working. The
+  // stale idle response must still produce no report.
+  assert.deepEqual(states(reports), [[undefined, "unknown"], ["ses_root", "working"]]);
 });
 
 test("unhydrated sessions use the TUI location and then the default location", async (t) => {

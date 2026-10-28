@@ -62,6 +62,13 @@ async function mapBounded(values, work, width = 6) {
 
 export async function loadTask(client, sessionID, { signal = AbortSignal.timeout(10_000), knownShells = [] } = {}) {
   const request = { signal };
+  async function runtimeDirectories() {
+    const locations = await client.debug.location.list(request);
+    if (!Array.isArray(locations) || locations.some((location) => typeof location?.directory !== 'string')) {
+      throw new Error('Invalid runtime location list');
+    }
+    return new Set(locations.map((location) => location.directory));
+  }
   const known = new Map();
   async function get(id) {
     if (!known.has(id)) known.set(id, await client.session.get({ sessionID: id }, request));
@@ -116,21 +123,36 @@ export async function loadTask(client, sessionID, { signal = AbortSignal.timeout
     for (let node = await get(id); node && !tree.has(node.id); node = known.get(node.parentID)) tree.set(node.id, node);
   });
   const sessions = [...tree.values()];
+  // Forms, permissions and shells belong to live location services. Asking an
+  // old session for them boots its location again, which fails after a temporary
+  // worktree was removed. The server's registry proves which volatile stores
+  // exist; persisted child history and inboxes must still be read for every node.
+  const runtimeBefore = await runtimeDirectories();
+  const hasRuntime = (session) => runtimeBefore.has(session.location.directory);
+  if (sessions.some((session) => Object.hasOwn(activeMap, session.id) && !hasRuntime(session))) {
+    throw new Error('Active task location is unavailable');
+  }
   const records = await mapBounded(sessions, async (session) => {
     const input = { sessionID: session.id };
     const [inbox, forms, permissions] = await Promise.all([
-      client.session.inbox.list(input, request), client.session.form.list(input, request), client.permission.list(input, request),
+      client.session.inbox.list(input, request),
+      hasRuntime(session) ? client.session.form.list(input, request) : [],
+      hasRuntime(session) ? client.permission.list(input, request) : [],
     ]);
     return { inbox, forms, permissions };
   });
   const [messages, locations, activeNow] = await Promise.all([
     client.message.list({ sessionID: root.id, type: 'assistant', order: 'desc', limit: 1 }, request),
-    mapBounded([...new Set(sessions.map((session) => session.location.directory))],
+    mapBounded([...new Set(sessions.filter(hasRuntime).map((session) => session.location.directory))],
       async (directory) => client.shell.list({ location: { directory } }, request)),
     client.session.active(request),
   ]);
   // If execution started during the snapshot, refuse to publish an idle result.
   if (Object.keys(activeNow).some((id) => !Object.hasOwn(activeMap, id))) throw new Error('Activity changed during snapshot');
+  const runtimeAfter = await runtimeDirectories();
+  if (sessions.some((session) => !hasRuntime(session) && runtimeAfter.has(session.location.directory))) {
+    throw new Error('Task runtime locations changed during snapshot');
+  }
   const shells = new Map(locations.flatMap((result) => result.data.map((shell) => ({ ...shell, location: result.location })))
     .filter((shell) => tree.has(shell.metadata?.sessionID)).map((shell) => [shell.id, shell]));
   // shell.list is running-only. Refetch disappeared commands by their original

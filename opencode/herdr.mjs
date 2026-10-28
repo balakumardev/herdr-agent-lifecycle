@@ -71,7 +71,8 @@ export function createHerdrReporter(env = process.env, { timeoutMs = 750, comman
       const current = () => !lifetime.signal.aborted && !signal?.aborted &&
         registry.owners.get(ownerKey) === lifetime && isCurrent();
       const delivery = queue.then(async () => {
-        if (!current() || !snapshot?.rootID || !["working", "blocked", "idle"].includes(snapshot.state)) return false;
+        if (!current() || !["working", "blocked", "idle", "unknown"].includes(snapshot?.state) ||
+            (!snapshot.rootID && snapshot.state !== "unknown")) return false;
         const key = JSON.stringify([snapshot.rootID, snapshot.state]);
         if (key === acknowledged) return true;
         // A lost acknowledgement does not prove Herdr ignored the write. Until
@@ -87,8 +88,10 @@ export function createHerdrReporter(env = process.env, { timeoutMs = 750, comman
             agent: AGENT,
             seq,
             state: snapshot.state,
-            agent_session_id: snapshot.rootID,
-            resume_argv: [command, "--session", snapshot.rootID],
+            ...(snapshot.rootID ? {
+              agent_session_id: snapshot.rootID,
+              resume_argv: [command, "--session", snapshot.rootID],
+            } : {}),
             message: snapshot.reason,
           },
         }, {

@@ -115,6 +115,7 @@ function clientFixture() {
   const unrelated = { id: 'ses_other_root', time: { created: 2 }, location: { directory: '/elsewhere' } };
   const infos = new Map([root, child, grandchild, unrelated].map((s) => [s.id, s]));
   return {
+    debug: { location: { list: async () => ['/project', '/other', '/elsewhere'].map((directory) => ({ directory })) } },
     session: {
       get: async ({ sessionID }) => { assert(infos.has(sessionID)); return infos.get(sessionID); },
       list: async ({ parentID, cursor }) => {
@@ -183,4 +184,77 @@ test('snapshot refetches a known shell after it disappears from the running-only
   };
   const input = await loadTask(client, 'ses_root', { knownShells: [shell] });
   assert.equal(classifyTask(input).reason, 'awaiting-parent');
+});
+
+function retiredLocationFixture() {
+  const client = clientFixture();
+  const root = snapshot().root;
+  const retired = { id: 'ses_retired', parentID: root.id, outcome: 'succeeded', time: { created: 15, idle: 120 },
+    location: { directory: '/removed-temporary-worktree' } };
+  const get = client.session.get;
+  client.session.get = async (input) => input.sessionID === root.id ? root : input.sessionID === retired.id ? retired : get(input);
+  const list = client.session.list;
+  client.session.list = async (input) => {
+    const page = await list(input);
+    return input.parentID === root.id && !input.cursor ? { ...page, data: [...page.data, retired] } : page;
+  };
+  const unavailable = () => { throw new Error('FileSystem.realPath: NotFound: removed-temporary-worktree'); };
+  client.session.form.list = async ({ sessionID }) => sessionID === retired.id ? unavailable() : [];
+  client.permission.list = async ({ sessionID }) => sessionID === retired.id ? unavailable() : [];
+  client.shell.list = async ({ location }) => location.directory === retired.location.directory ? unavailable() : { data: [], location };
+  return { client, root, retired };
+}
+
+test('a retired worktree cannot hide live descendants or erase the parent continuation barrier', async () => {
+  const { client, root } = retiredLocationFixture();
+  const running = await loadTask(client, root.id);
+  assert.equal(classifyTask(running).state, 'working');
+  assert.equal(classifyTask(running).activeCount, 1);
+  assert.ok(running.sessions.some((session) => session.id === 'ses_retired'));
+  client.session.active = async () => ({});
+  assert.equal(classifyTask(await loadTask(client, root.id)).reason, 'awaiting-parent');
+  root.time.idle = 140;
+  client.message.list = async () => ({ data: [{ ...snapshot().lastAssistant, time: { completed: 139 } }], cursor: {} });
+  assert.equal(classifyTask(await loadTask(client, root.id)).complete, true);
+});
+
+test('queued input in an unloaded child is still pending work', async () => {
+  const { client, root, retired } = retiredLocationFixture();
+  client.session.active = async () => ({});
+  root.time.idle = 140;
+  client.message.list = async () => ({ data: [{ ...snapshot().lastAssistant, time: { completed: 139 } }], cursor: {} });
+  client.session.inbox.list = async ({ sessionID }) => sessionID === retired.id ? [{ id: 'input_waiting', sessionID, type: 'synthetic' }] : [];
+  const result = classifyTask(await loadTask(client, root.id));
+  assert.equal(result.state, 'working');
+  assert.equal(result.pendingCount, 1);
+  assert.equal(result.complete, false);
+});
+
+test('an unavailable runtime-location registry is not evidence that no work remains', async () => {
+  const client = clientFixture();
+  client.debug.location.list = async () => { throw new Error('location registry unavailable'); };
+  await assert.rejects(loadTask(client, 'ses_root'), /location registry unavailable/);
+});
+
+test('a live child cannot be treated as an empty unloaded runtime', async () => {
+  const client = clientFixture();
+  client.debug.location.list = async () => [{ directory: '/project' }];
+  await assert.rejects(loadTask(client, 'ses_root'), /Active task location/);
+});
+
+test('a child runtime appearing during a snapshot is reread before completion', async () => {
+  const { client, root, retired } = retiredLocationFixture();
+  client.session.active = async () => ({});
+  let reads = 0;
+  client.debug.location.list = async () => [
+    { directory: '/project' }, { directory: '/other' },
+    ...(reads++ ? [{ directory: retired.location.directory }] : []),
+  ];
+  client.session.form.list = async ({ sessionID }) => sessionID === retired.id ? [{ id: 'frm_resumed', sessionID, title: 'Choose', fields: [] }] : [];
+  client.permission.list = async () => [];
+  client.shell.list = async ({ location }) => ({ data: [], location });
+  await assert.rejects(loadTask(client, root.id), /Task runtime locations changed/);
+  const result = classifyTask(await loadTask(client, root.id));
+  assert.equal(result.state, 'blocked');
+  assert.deepEqual(result.questionIDs, ['frm_resumed']);
 });
