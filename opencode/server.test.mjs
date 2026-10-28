@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { TaskMonitor } from './monitor.mjs';
+import { Effect, JsonSchema, Schema, SchemaRepresentation } from 'effect';
 
 const key = Symbol.for('local.opencode.task-lifecycle.v3');
 
@@ -41,6 +42,40 @@ test('a stale location cannot downgrade a newer process-owned public release', a
   t.after(stop);
   assert.equal((await methods.health()).version, '1.0.1');
   assert.equal(shared.controller.signal.aborted, false);
+});
+
+test('a partial live upgrade remains valid through an older location RPC registration', async (t) => {
+  const root = { id: 'ses_root', title: 'Task', outcome: 'succeeded', location: { directory: '/project' }, time: { idle: 100 } };
+  const snapshot = { root, sessions: [root], active: [], inbox: [], forms: [], permissions: [], shells: [],
+    lastAssistant: { id: 'msg_final', type: 'assistant', finish: 'stop', time: { completed: 99 }, content: [{ type: 'text', text: 'Finished.' }] } };
+  const shared = { refs: 1, controller: new AbortController(), build: '1.0.2', revision: 4,
+    monitor: new TaskMonitor({ load: async () => structuredClone(snapshot), notifier: { publish: async () => ({ status: 'disabled' }) } }) };
+  globalThis[key] = shared;
+  t.after(() => { shared.controller.abort(); delete globalThis[key]; });
+  await shared.monitor.inspect(root.id);
+  let oldDefinition;
+  let oldMethods;
+  t.after(await (await plugin('1.0.2')).setup({ rpc: { register: async (definition, methods) => {
+    oldDefinition = structuredClone(definition);
+    // Existing v1.0.2 locations keep this schema when the shared monitor upgrades.
+    oldDefinition.methods.snapshot.output.properties.state.enum = ['working', 'blocked', 'idle'];
+    oldMethods = methods;
+  } } }));
+  t.after(await (await plugin('1.0.3')).setup({ rpc: { register: async () => {} } }));
+  let release;
+  shared.monitor.load = () => new Promise(resolve => { release = resolve; });
+  const pending = oldMethods.snapshot({ sessionID: root.id });
+  shared.monitor.observe({ type: 'session.inbox.enqueued', data: { sessionID: root.id } });
+  release(structuredClone(snapshot));
+  const result = await pending;
+  assert.equal((await oldMethods.health()).version, '1.0.3');
+  const codec = Schema.make(SchemaRepresentation.fromJsonSchemaDocument(
+    JsonSchema.fromSchemaDraft2020_12(oldDefinition.methods.snapshot.output)).ast);
+  await assert.doesNotReject(() => Effect.runPromise(Schema.decodeUnknownEffect(codec)(result)),
+    'the retained registration must not turn a refreshing snapshot into rpc.invalid_output');
+  assert.equal(result.reason, 'refreshing');
+  assert.equal(result.complete, false);
+  assert.equal(result.completionKey, undefined);
 });
 
 test('invalid configuration rejects plugin setup without a detached monitor failure', async (t) => {

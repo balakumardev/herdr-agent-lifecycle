@@ -15,7 +15,9 @@ The OpenCode adapter waits for the root's successful final reply after its
 descendants and owned shells settle. The Claude adapter observes native turns,
 displayed questions, background tasks, and asynchronous review completion.
 Both use Herdr's normal socket API. A completed task is reported as `idle`;
-Herdr decides whether the UI labels that state Idle or Done.
+Herdr shows **Done** for an unread completion and **Idle** after it has been
+viewed. Refreshing an unchanged OpenCode task does not create a new completion
+or reset that read/unread state.
 
 ## Install a release
 

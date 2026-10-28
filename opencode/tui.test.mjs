@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
 import plugin from "./tui.js";
 import { LifecycleRPC } from "./contract.mjs";
+import { TaskMonitor } from "./monitor.mjs";
 
 function snapshot(overrides = {}) {
   return {
@@ -49,10 +50,10 @@ async function socketFixture(t, reply) {
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(path, resolve); });
   t.after(async () => {
     for (const socket of sockets) socket.destroy();
-    await new Promise((resolve) => server.close(resolve));
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
     await rm(directory, { recursive: true, force: true });
   });
-  return { reports, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: path, HERDR_PANE_ID: "pane-test" } };
+  return { reports, server, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: path, HERDR_PANE_ID: "pane-test" } };
 }
 
 function host(overrides = {}) {
@@ -180,6 +181,182 @@ test("failed and malformed snapshots preserve the previous report and recover on
   ui.state.response = snapshot({ state: "blocked", reason: "question", questionIDs: ["q1"] });
   await until(() => reports.length === 2, "recovery report");
   assert.deepEqual(states(reports), [["ses_root", "working"], ["ses_root", "blocked"]]);
+});
+
+test("an unrelated server event cannot reannounce the same completed result to Herdr", async (t) => {
+  const { reports, env } = await socketFixture(t);
+  const root = { id: "ses_root", title: "Finished task", outcome: "succeeded", location: { directory: "/project" }, time: { idle: 100 } };
+  const data = { root, sessions: [root], active: [], inbox: [], forms: [], permissions: [], shells: [],
+    lastAssistant: { id: "msg_final", type: "assistant", finish: "stop", time: { completed: 99 }, content: [{ type: "text", text: "Finished." }] } };
+  const monitor = new TaskMonitor({ load: async () => structuredClone(data), notifier: { publish: async () => ({ status: "disabled" }) } });
+  monitor.observe({ type: "session.created", data: { sessionID: "ses_other", location: { directory: "/elsewhere" } } });
+  const ui = host({ options: { refreshIntervalMs: 25 }, resolve: () => monitor.inspect("ses_root", true) });
+  start(t, ui, env);
+  await until(() => ui.calls.length >= 2, "initial completion acknowledged");
+  let invalidations = 0;
+  monitor.load = async () => {
+    if (invalidations++ < 3) monitor.observe({ type: "session.execution.started", data: { sessionID: "ses_other" } });
+    return structuredClone(data);
+  };
+  await until(() => invalidations >= 5, "reconciliation after unrelated activity");
+  assert.deepEqual(states(reports), [["ses_root", "idle"]], "bookkeeping must not reset Herdr's read/unread completion");
+});
+
+test("refreshing snapshots preserve completion attention and retry promptly", async (t) => {
+  // The refresh reason takes precedence over its wire state value.
+  for (const state of ["working", "unknown"]) await t.test(state, async (t) => {
+    const { reports, env } = await socketFixture(t);
+    const completed = snapshot({ state: "idle", complete: true, activeCount: 0, reason: "done", completionKey: "done:ses_root:msg_final" });
+    const ui = host({ response: completed, options: { retryIntervalMs: 20, requestTimeoutMs: 500 } });
+    start(t, ui, env);
+    await until(() => reports.length === 1, "initial completion");
+    let reads = 0;
+    ui.state.resolve = () => Promise.resolve(++reads <= 2 ? snapshot({ state, reason: "refreshing", activeCount: 0 }) : completed);
+    ui.emit("shell.exited", { id: "sh_other" });
+    await until(() => reads >= 3, "fresh snapshot retried without the normal long refresh delay");
+    assert.deepEqual(states(reports), [["ses_root", "idle"]], "neither fake Working nor Unknown may erase a completed result during a short refresh");
+    ui.state.resolve = undefined;
+    ui.state.response = snapshot();
+    ui.emit("session.execution.started");
+    await until(() => reports.length >= 2, "genuine new work");
+    assert.equal(reports.at(-1).params.state, "working");
+    ui.state.response = { ...completed, completionKey: "done:ses_root:msg_new_final" };
+    ui.emit("session.execution.succeeded");
+    await until(() => reports.length >= 3, "genuine new completion");
+    assert.deepEqual(states(reports), [["ses_root", "idle"], ["ses_root", "working"], ["ses_root", "idle"]]);
+  });
+});
+
+test("a first refreshing snapshot is Unknown rather than fabricated Working", async (t) => {
+  const { reports, env } = await socketFixture(t);
+  const ui = host({ response: snapshot({ state: "working", reason: "refreshing", activeCount: 0 }) });
+  start(t, ui, env);
+  await until(() => reports.length >= 1, "initial uncertainty claimed");
+  assert.equal(reports[0].params.state, "unknown");
+  assert.equal(reports[0].params.agent_session_id, undefined);
+});
+
+test("continuous snapshot invalidation cannot leave completed status trusted indefinitely", async (t) => {
+  const { reports, env } = await socketFixture(t);
+  const ui = host({ response: snapshot({ state: "idle", complete: true, reason: "done", activeCount: 0 }),
+    options: { retryIntervalMs: 20, requestTimeoutMs: 60 } });
+  start(t, ui, env);
+  await until(() => reports.length === 1, "initial completion");
+  ui.state.response = snapshot({ state: "working", reason: "refreshing", activeCount: 0 });
+  ui.emit("session.execution.started");
+  await until(() => reports.some(({ params }) => params.state === "unknown"), "bounded freshness deadline retracts an unverifiable idle");
+  assert.deepEqual(states(reports), [["ses_root", "idle"], ["ses_root", "unknown"]]);
+  ui.state.response = snapshot();
+  await until(() => reports.at(-1).params.state === "working", "actual activity recovered");
+});
+
+test("the freshness deadline runs despite event races, long retry delays, and previous states", async (t) => {
+  for (const [name, initial, race, retryIntervalMs] of [
+    ["events invalidate every subsequent read", "idle", true, 20],
+    ["retry exceeds the freshness budget", "idle", false, 500],
+    ["previously Working", "working", false, 20],
+    ["previously Blocked", "blocked", false, 20],
+  ]) await t.test(name, async (t) => {
+    const { reports, env } = await socketFixture(t);
+    const ui = host({ response: snapshot({ state: initial, complete: initial === "idle", activeCount: 0, reason: initial === "idle" ? "done" : "running" }),
+      options: { refreshIntervalMs: 20, requestTimeoutMs: 60, retryIntervalMs } });
+    start(t, ui, env);
+    await until(() => ui.calls.length >= 2, "initial state acknowledged");
+    let reads = 0;
+    ui.state.resolve = () => {
+      if (++reads > 1 && race) ui.emit("session.execution.started", { sessionID: "ses_other" });
+      return Promise.resolve(snapshot({ state: "working", complete: false, activeCount: 0, reason: "refreshing" }));
+    };
+    ui.emit("session.execution.started", { sessionID: "ses_other" });
+    await until(() => reads >= 1, "freshness budget began");
+    const began = Date.now();
+    await until(() => reports.some(({ params }) => params.state === "unknown"), "independent deadline reports uncertainty");
+    assert.ok(Date.now() - began < 250, "a 500ms retry cannot postpone the 60ms freshness deadline");
+    assert.deepEqual(states(reports), [["ses_root", initial], ["ses_root", "unknown"]]);
+  });
+});
+
+test("navigation cancels a pending freshness deadline", async (t) => {
+  const { reports, env } = await socketFixture(t);
+  const ui = host({ response: snapshot({ state: "idle", complete: true, reason: "done", activeCount: 0 }),
+    options: { refreshIntervalMs: 20, requestTimeoutMs: 60, retryIntervalMs: 500 } });
+  start(t, ui, env);
+  await until(() => ui.calls.length >= 2, "initial completion acknowledged");
+  let reads = 0;
+  ui.state.resolve = () => { reads++; return Promise.resolve(snapshot({ reason: "refreshing", activeCount: 0 })); };
+  ui.emit("session.execution.started");
+  await until(() => reads >= 1, "deadline armed");
+  ui.state.route = { type: "home" };
+  ui.emit("session.execution.started");
+  await delay(100);
+  assert.deepEqual(states(reports), [["ses_root", "idle"]]);
+});
+
+test("brief navigation at expiry cannot leave an exhausted freshness deadline trusted", async (t) => {
+  const { reports, env } = await socketFixture(t);
+  const ui = host({ response: snapshot({ state: "idle", complete: true, reason: "done", activeCount: 0 }),
+    options: { pollIntervalMs: 60_000, requestTimeoutMs: 200, retryIntervalMs: 20 } });
+  const away = deferred();
+  const held = deferred();
+  const currentRoute = ui.api.ui.router.current;
+  ui.api.ui.router.current = () => {
+    if (ui.state.route.type === "home") away.resolve();
+    return currentRoute();
+  };
+  start(t, ui, env);
+  await until(() => reports.length === 1, "initial completion");
+  // Let the real socket acknowledgement settle, then arrange an RPC spanning
+  // expiry so only the deadline observes the brief navigation away and back.
+  await delay(10);
+  let reads = 0;
+  ui.state.resolve = () => {
+    reads++;
+    return reads === 1 ? Promise.resolve(snapshot({ reason: "refreshing", activeCount: 0 })) : held.promise;
+  };
+  ui.emit("session.execution.started");
+  await until(() => reads === 1, "freshness deadline armed");
+  ui.emit("session.execution.started");
+  await until(() => reads === 2, "second RPC spans expiry");
+  ui.state.route = { type: "home" };
+  await Promise.race([away.promise, delay(1_000).then(() => { throw new Error("Deadline never checked navigation"); })]);
+  assert.deepEqual(states(reports), [["ses_root", "idle"]], "an obsolete selection must not report at expiry");
+  ui.state.route = { type: "session", sessionID: "ses_root" };
+  ui.state.resolve = () => {
+    reads++;
+    ui.emit("session.execution.started");
+    return Promise.resolve(snapshot({ reason: "refreshing", activeCount: 0 }));
+  };
+  held.resolve(snapshot({ reason: "refreshing", activeCount: 0 }));
+  ui.emit("session.execution.started");
+  await until(() => reports.some(({ params }) => params.state === "unknown"), "returning to the same selection cannot revive expired confidence");
+  assert.deepEqual(states(reports), [["ses_root", "idle"], ["ses_root", "unknown"]]);
+});
+
+test("bootstrap uncertainty retries Unknown after a failed deadline delivery", async (t) => {
+  for (const mode of ["socket unavailable", "malformed acknowledgement"]) await t.test(mode, async (t) => {
+    let accepting = false;
+    const { reports, server, env } = await socketFixture(t, request => accepting ? undefined : { id: request.id });
+    if (mode === "socket unavailable") await new Promise(resolve => server.close(resolve));
+    const ui = host({ options: { requestTimeoutMs: 60, retryIntervalMs: 20 } });
+    ui.state.resolve = () => {
+      ui.emit("session.execution.started", { sessionID: "ses_child" });
+      return Promise.resolve(snapshot());
+    };
+    start(t, ui, env);
+    await until(() => ui.calls.length >= 9, "deadline expired while every bootstrap read was invalidated");
+    if (mode === "malformed acknowledgement") assert.ok(reports.length > 0, "the first Unknown reached a rejecting receiver");
+    const attempts = reports.length;
+    accepting = true;
+    if (!server.listening) await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(env.HERDR_SOCKET_PATH, resolve);
+    });
+    await until(() => reports.length > attempts, "Unknown retried after transport recovery without an authoritative snapshot");
+    assert.ok(reports.every(({ params }) => params.state === "unknown" && params.agent_session_id === undefined));
+    ui.state.resolve = undefined;
+    await until(() => reports.at(-1).params.state === "working", "a fresh real snapshot still recovers the pane");
+    assert.equal(reports.at(-1).params.agent_session_id, "ses_root");
+  });
 });
 
 test("a failed first snapshot claims unknown state without inventing a root session", async (t) => {
