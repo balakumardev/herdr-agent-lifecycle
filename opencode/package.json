@@ -1,0 +1,9 @@
+{
+  "name": "local-opencode-task-lifecycle",
+  "version": "1.0.2",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./index.js", "./tui": "./tui.js" },
+  "scripts": { "test": "node --test *.test.mjs" },
+  "dependencies": { "@opencode/client": "2.0.18" }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "task-lifecycle",
+  "version": "1.0.4",
+  "description": "Child-aware Herdr state and completion/question notifications for Claude Code",
+  "author": { "name": "Local configuration" }
+}

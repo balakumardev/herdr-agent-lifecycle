@@ -1,0 +1,12 @@
+{
+  "description": "Native post-turn and question lifecycle observer",
+  "modules": ["./register.js"],
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_TASK_LIFECYCLE_PYTHON:-python3}\" \"${CLAUDE_PLUGIN_ROOT}/event_hook.py\"", "timeout": 10 }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_TASK_LIFECYCLE_PYTHON:-python3}\" \"${CLAUDE_PLUGIN_ROOT}/event_hook.py\"", "timeout": 10 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_TASK_LIFECYCLE_PYTHON:-python3}\" \"${CLAUDE_PLUGIN_ROOT}/event_hook.py\"", "timeout": 10 }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_TASK_LIFECYCLE_PYTHON:-python3}\" \"${CLAUDE_PLUGIN_ROOT}/event_hook.py\"", "timeout": 10 }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_TASK_LIFECYCLE_PYTHON:-python3}\" \"${CLAUDE_PLUGIN_ROOT}/event_hook.py\"", "timeout": 10 }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_TASK_LIFECYCLE_PYTHON:-python3}\" \"${CLAUDE_PLUGIN_ROOT}/event_hook.py\"", "timeout": 10 }] }]
+  }
+}

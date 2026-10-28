@@ -1,0 +1,12 @@
+node_modules/
+__pycache__/
+*.pyc
+.superpowers/
+.codebase-memory/
+dist/
+.env
+.DS_Store
+coverage/
+.claude-plugin/types/
+claude/.claude-plugin/types/
+claude/types/

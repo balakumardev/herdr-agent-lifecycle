@@ -1,0 +1,1 @@
+{"modules":["./register.js"],"hooks":{"Stop":[{"hooks":[{"type":"command","command":"python3 \"${CLAUDE_PLUGIN_ROOT}/stop-control.py\"","timeout":2}]}]}}
