@@ -45,6 +45,10 @@ jobs:
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm ci --prefix opencode --ignore-scripts --no-audit --no-fund
       - run: npm test
+      - name: Verify independently installed release archives
+        run: |
+          python3 scripts/prepare-release.py 0.0.0
+          python3 scripts/verify-packages.py --dist dist --version 0.0.0
 
   release:
     name: Release

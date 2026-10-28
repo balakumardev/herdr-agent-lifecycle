@@ -156,6 +156,10 @@ claude plugin test claude
 
 The portable tests use temporary homes and loopback HTTP/socket fixtures.
 Native Claude tests require a compatible locally installed Claude CLI.
+CI also builds the two release archives, installs the OpenCode package with its
+own dependencies, applies/restores both installers in a temporary home, and runs
+the runtime suites from the extracted source archive. To verify already prepared
+assets, run `python3 scripts/verify-packages.py --dist dist --version X.Y.Z`.
 
 The live host checks use a local model-stream fixture and loopback notifications:
 
