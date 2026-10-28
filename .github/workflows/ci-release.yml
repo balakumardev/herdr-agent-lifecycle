@@ -65,7 +65,17 @@ jobs:
         with:
           python-version: '3.12'
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Recover or verify the previous tagged release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/recover-release.py --ref "refs/remotes/origin/$GITHUB_REF_NAME"
       - name: Publish versioned release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run release
+      - name: Verify published asset checksums
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git fetch origin
+          python3 scripts/recover-release.py --ref "refs/remotes/origin/$GITHUB_REF_NAME"

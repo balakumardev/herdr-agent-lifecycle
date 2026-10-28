@@ -6,7 +6,7 @@ module.exports = {
   plugins: [
     ['@semantic-release/commit-analyzer', {
       preset: 'conventionalcommits',
-      releaseRules: maintenance.map(type => ({ type, release: 'patch' })),
+      releaseRules: [{ breaking: true, release: 'major' }, ...maintenance.map(type => ({ type, release: 'patch' }))],
     }],
     ['@semantic-release/release-notes-generator', {
       preset: 'conventionalcommits',

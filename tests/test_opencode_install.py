@@ -78,6 +78,29 @@ class OpenCodeInstallTests(unittest.TestCase):
         self.assertIn({"package": str(self.plugin), "options": {"refreshIntervalMs": 5000}}, plugins)
         self.assertFalse(any((p.get("package") if isinstance(p, dict) else p) == str(old) for p in plugins))
 
+    def test_upgrade_replaces_an_escaped_file_url_and_preserves_its_options(self):
+        old = self.ready_plugin("release with spaces")
+        self.server["plugins"][1]["package"] = old.as_uri()
+        self.server_path.write_text(json.dumps(self.server))
+        self.run_installer("--apply")
+        plugins = json.loads(self.server_path.read_text())["plugins"]
+        self.assertIn({"package": str(self.plugin), "options": {"refreshIntervalMs": 5000}}, plugins)
+        self.assertFalse(any((p.get("package") if isinstance(p, dict) else p) == old.as_uri() for p in plugins))
+
+    def test_reporter_exclusion_wins_over_a_later_explicit_reenable(self):
+        for path, reporter in ((self.server_path, "herdr.opencode.agent-state"),
+                               (self.cli_path, "herdr.opencode.session-selection")):
+            config = json.loads(path.read_text())
+            config["plugins"].extend(["-" + reporter, reporter])
+            path.write_text(json.dumps(config))
+        self.run_installer("--apply")
+        for path, reporter in ((self.server_path, "herdr.opencode.agent-state"),
+                               (self.cli_path, "herdr.opencode.session-selection")):
+            directives = [p for p in json.loads(path.read_text())["plugins"]
+                          if isinstance(p, str) and p in (reporter, "-" + reporter)]
+            self.assertEqual(directives[-1], "-" + reporter)
+        self.assertEqual(self.run_installer("--apply")["changedFiles"], [])
+
     def test_missing_dependencies_cannot_expose_an_unloadable_plugin(self):
         (self.plugin / "node_modules/@opencode/client/package.json").unlink()
         before = self.server_path.read_bytes()
@@ -120,6 +143,14 @@ class OpenCodeInstallTests(unittest.TestCase):
         before = {p: p.read_bytes() for p in (self.server_path, self.cli_path)}
         self.run_installer("--apply", restore=result["backupDirectory"], ok=False)
         self.assertEqual({p: p.read_bytes() for p in before}, before)
+
+    def test_restore_refuses_to_undo_a_later_permission_tightening(self):
+        self.server_path.chmod(0o644)
+        result = self.run_installer("--apply")
+        self.server_path.chmod(0o600)
+        before = {p: (p.read_bytes(), p.stat().st_mode) for p in (self.server_path, self.cli_path)}
+        self.run_installer("--apply", restore=result["backupDirectory"], ok=False)
+        self.assertEqual({p: (p.read_bytes(), p.stat().st_mode) for p in before}, before)
 
     def test_symlink_configuration_is_not_replaced(self):
         real = self.root / "real-config.json"

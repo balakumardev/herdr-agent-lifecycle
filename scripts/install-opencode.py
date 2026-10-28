@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+from urllib.parse import unquote, urlsplit
 import uuid
 
 
@@ -79,7 +80,13 @@ def is_owned(value, destination, plugin):
         return True
     if value.startswith("-"):
         return False
-    path = Path(value.removeprefix("file://"))
+    if value.startswith("file:"):
+        url = urlsplit(value)
+        if url.netloc not in ("", "localhost") or url.query or url.fragment:
+            return False
+        path = Path(unquote(url.path))
+    else:
+        path = Path(value)
     if not path.is_absolute():
         path = destination / path
     if path.resolve() == destination / "integrations/task-lifecycle":
@@ -96,6 +103,8 @@ def register(entries, destination, plugin, disabled):
     owned = False
     for item in entries:
         package = item.get("package") if isinstance(item, dict) else item
+        if package == disabled:
+            continue
         if is_owned(package, destination, plugin):
             if owned:
                 raise ValueError("Multiple lifecycle registrations need a manual merge")
@@ -103,10 +112,9 @@ def register(entries, destination, plugin, disabled):
             result.append({**item, "package": str(plugin)} if isinstance(item, dict) else str(plugin))
         else:
             result.append(item)
-    if disabled not in result:
-        result.append(disabled)
     if not owned:
         result.append(str(plugin))
+    result.append(disabled)
     return result
 
 
@@ -119,8 +127,7 @@ def installation_plan(destination, plugin):
     settings, terminal = read_config(config), read_config(cli)
     settings.setdefault("$schema", "https://opencode.ai/config.json")
     terminal.setdefault("$schema", "https://opencode.ai/v2/cli.json")
-    settings["plugins"] = register(settings.get("plugins", []), destination, plugin, "-herdr.opencode.agent-state")
-    terminal["plugins"] = register(terminal.get("plugins", []), destination, plugin, "-herdr.opencode.session-selection")
+    settings.setdefault("plugins", [])
     patched = {}
     bridge_path = destination / "plugins/claude-code-hooks.js"
     bridge = read_bytes(bridge_path)
@@ -135,6 +142,8 @@ def installation_plan(destination, plugin):
                 break
         else:
             settings["plugins"].append({"package": "./plugins/claude-code-hooks.js", "options": {"notifications": False}})
+    settings["plugins"] = register(settings["plugins"], destination, plugin, "-herdr.opencode.agent-state")
+    terminal["plugins"] = register(terminal.get("plugins", []), destination, plugin, "-herdr.opencode.session-selection")
     patched[config], patched[cli] = encoded(settings), encoded(terminal)
     changes = []
     for path, data in patched.items():
@@ -190,7 +199,8 @@ def restore_plan(backup):
         current = read_bytes(path)
         if current == original:
             continue
-        if digest(current) != record["afterHash"]:
+        if (digest(current) != record["afterHash"]
+                or stat.S_IMODE(path.stat().st_mode) != record["mode"]):
             raise ValueError("A configuration file changed after installation; refusing to overwrite it")
         changes.append({"path": path, "old": current, "data": original, "mode": record["mode"]})
     return destination, changes
@@ -208,7 +218,8 @@ def main(argv=None):
     if args.restore:
         destination, changes = restore_plan(args.restore.expanduser().resolve())
         if args.apply:
-            if any(read_bytes(c["path"]) != c["old"] for c in changes):
+            if any(read_bytes(c["path"]) != c["old"] or stat.S_IMODE(c["path"].stat().st_mode) != c["mode"]
+                   for c in changes):
                 raise ValueError("Configuration changed during restore; no files restored")
             for change in changes:
                 if change["data"] is None:

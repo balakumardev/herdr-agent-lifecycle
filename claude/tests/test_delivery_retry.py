@@ -80,20 +80,18 @@ class DeliveryRetryTests(unittest.TestCase):
         self.fail("Timed out waiting for " + description)
 
     def worker_idle(self):
-        path = self.state_dir / "delivery-worker.lock"
-        if not path.exists():
-            return True
-        with path.open("r+") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return True
-            except BlockingIOError:
-                return False
+        for path in (self.state_dir / "delivery-workers-v2").glob("*.lock"):
+            with path.open("r+") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return False
+        return True
 
     def cleanup_workers(self):
-        queue = self.state_dir / "delivery-queue.json"
+        queue = self.state_dir / "delivery-queue-v2.json"
         if queue.exists():
-            with locked(self.state_dir / "delivery-control.lock"):
+            with locked(self.state_dir / "delivery-control-v2.lock"):
                 save_json(queue, {})
         self.wait_for(self.worker_idle, "test-owned worker exit")
         for process in self.processes:
@@ -106,7 +104,7 @@ class DeliveryRetryTests(unittest.TestCase):
     def expire_cooldown(self):
         # Simulate elapsed wall time without adding a test-only worker switch.
         # The transport and worker still read their real durable records.
-        queue = self.state_dir / "delivery-queue.json"
+        queue = self.state_dir / "delivery-queue-v2.json"
         if queue.exists():
             self.wait_for(lambda: all(job["nextAttemptAt"] > 0 for job in json.loads(queue.read_text()).values()),
                           "worker scheduling the failed attempt")
@@ -117,7 +115,7 @@ class DeliveryRetryTests(unittest.TestCase):
                     if data.get("nextAttemptAt"):
                         save_json(path, {**data, "nextAttemptAt": 0})
         if queue.exists():
-            with locked(self.state_dir / "delivery-control.lock"):
+            with locked(self.state_dir / "delivery-control-v2.lock"):
                 data = json.loads(queue.read_text())
                 save_json(queue, {key: {**job, "nextAttemptAt": 0} for key, job in data.items()})
 
@@ -132,13 +130,16 @@ class DeliveryRetryTests(unittest.TestCase):
         self.assertEqual(self.receipts()[0]["status"], "failed")
 
     def start_worker_in_pool(self, pool):
-        descriptor = os.open(self.state_dir / "delivery-worker.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        workers = self.state_dir / "delivery-workers-v2"
+        workers.mkdir(exist_ok=True)
+        route = runtime.digest(self.transport.notification_target())
+        descriptor = os.open(workers / (route + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return pool.submit(self.runtime.delivery_worker, descriptor)
 
     def clear_queue(self):
-        with locked(self.state_dir / "delivery-control.lock"):
-            save_json(self.state_dir / "delivery-queue.json", {})
+        with locked(self.state_dir / "delivery-control-v2.lock"):
+            save_json(self.state_dir / "delivery-queue-v2.json", {})
 
     def test_final_reply_recovers_after_the_admitting_command_has_exited(self):
         self.server.codes = [503, 200]
@@ -194,6 +195,55 @@ class DeliveryRetryTests(unittest.TestCase):
         self.assertEqual(self.receipts()[0]["status"], "sent")
         self.assertEqual([(path, body.decode()) for path, _, body in self.server.messages],
                          [("/configured-topic", "Configured final reply")])
+
+    def test_shared_state_keeps_each_sessions_notification_consent_and_destination(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def hold_first_request():
+            if not entered.is_set():
+                entered.set()
+                release.wait(5)
+
+        self.server.on_post = hold_first_request
+        try:
+            for index, enabled, topic in ((1, True, "first-topic"), (2, False, "disabled-topic"),
+                                          (3, True, "second-topic")):
+                session = "configured-session-" + str(index)
+                config = self.root / (session + ".json")
+                config.write_text(json.dumps({"notifications": {
+                    "enabled": enabled, "topic": topic, "endpoint": self.transport.endpoint}}))
+                observer = runtime.Runtime(self.state_dir, Transport(self.state_dir, topic=None),
+                                           env={}, hook_audit=lambda _: ([], False))
+                events = [("bind", {"born_at": 100}), ("start", {"turn_id": "turn"}),
+                          ("prepare_stop", {"hook_event_name": "Stop", "event_key": "stop",
+                                            "background_tasks": [], "session_crons": []}),
+                          ("stop_verdict", {"event_key": "stop", "accepted": True})]
+                for seq, (action, data) in enumerate(events, 1):
+                    observer.accept({"session_id": session, "owner": session, "seq": seq,
+                                     "action": action, **data})
+                packet = {"session_id": session, "owner": session, "seq": 5, "action": "complete",
+                          "turn_id": "turn", "has_answer": True, "reason": "answer",
+                          "answer_text": "Reply from session " + str(index)}
+                env = {k: v for k, v in self.env.items() if k not in (
+                    "CLAUDE_TASK_LIFECYCLE_TOPIC_FILE", "CLAUDE_TASK_LIFECYCLE_ENDPOINT")}
+                env["HERDR_LIFECYCLE_CONFIG"] = str(config)
+                result = subprocess.run([sys.executable, "-B", str(ROOT / "runtime.py")],
+                                        input=json.dumps(packet), text=True, capture_output=True,
+                                        cwd=ROOT, env=env, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if index == 1:
+                    self.assertTrue(entered.wait(3), "first worker never made its HTTP request")
+        finally:
+            release.set()
+        self.wait_for(lambda: len(self.receipts()) >= 2, "independent notification destinations")
+        self.wait_for(self.worker_idle, "all configured delivery workers exiting")
+        self.assertEqual([(path, body.decode()) for path, _, body in self.server.messages],
+                         [("/first-topic", "Reply from session 1"),
+                          ("/second-topic", "Reply from session 3")])
+        self.assertFalse(self.runtime.payload_path("configured-session-2").exists())
+        metadata = "\n".join(p.read_text() for p in self.state_dir.rglob("*") if p.is_file())
+        for private in ("first-topic", "second-topic", "disabled-topic", "Reply from session"):
+            self.assertNotIn(private, metadata)
 
     def test_session_end_preserves_a_qualified_deferred_final_reply(self):
         self.server.codes = [503, 200]
@@ -270,7 +320,7 @@ class DeliveryRetryTests(unittest.TestCase):
     def test_worker_retries_queue_enospc_while_retaining_ownership(self):
         self.runtime.background_delivery = True
         self.server.codes = [503, 200]
-        queue = self.state_dir / "delivery-queue.json"
+        queue = self.state_dir / "delivery-queue-v2.json"
         failed, parked, recovered = threading.Event(), threading.Event(), threading.Event()
         sleeps = []
         real_sleep = time.sleep
@@ -361,7 +411,7 @@ class DeliveryRetryTests(unittest.TestCase):
     def test_broken_retry_queue_cannot_prevent_new_work_revoking_a_reply(self):
         self.server.codes = [503]
         self.complete()
-        (self.state_dir / "delivery-queue.json").write_text("not-json")
+        (self.state_dir / "delivery-queue-v2.json").write_text("not-json")
         self.assertEqual(self.event("activity")["state"], "working")
         self.assertIsNone(self.runtime._load("session-one")["candidate"])
         self.assertFalse(self.runtime.payload_path("session-one").exists())

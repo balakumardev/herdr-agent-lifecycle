@@ -282,11 +282,11 @@ class Runtime:
         return [(kind, identity) for kind, identity in notices if digest([kind, identity]) not in settled]
 
     def _cancel_delivery(self, session_id):
-        queue = self.root / "delivery-queue.json"
+        queue = self.root / "delivery-queue-v2.json"
         if not queue.exists():
             return
         try:
-            with locked(self.root / "delivery-control.lock"):
+            with locked(self.root / "delivery-control-v2.lock"):
                 jobs = load_json(queue, {})
                 if jobs.pop(digest(session_id), None) is not None:
                     save_json(queue, jobs)
@@ -295,27 +295,28 @@ class Runtime:
             # persisted so current() can reject the old job before any HTTP.
             pass
 
-    def _start_delivery_worker(self):
-        """Called under delivery-control.lock; pass ownership across exec atomically."""
-        descriptor = os.open(self.root / "delivery-worker.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    def _start_delivery_worker(self, target):
+        """Share workers only for the same admitted consent and destination."""
+        workers = self.root / "delivery-workers-v2"
+        workers.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(workers / (digest(target) + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
         try:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return
-            env = {**self.env, "CLAUDE_TASK_LIFECYCLE_STATE_DIR": str(self.root.resolve()),
-                   "CLAUDE_TASK_LIFECYCLE_ENDPOINT": self.transport.endpoint}
-            if self.transport.topic_file is not None:
-                env["CLAUDE_TASK_LIFECYCLE_TOPIC_FILE"] = str(self.transport.topic_file.resolve())
-            else:
-                env.pop("CLAUDE_TASK_LIFECYCLE_TOPIC_FILE", None)
+            env = {**self.env, "CLAUDE_TASK_LIFECYCLE_STATE_DIR": str(self.root.resolve())}
             process = subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve()), "--delivery-worker", str(descriptor)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, close_fds=True, pass_fds=(descriptor,), env=env)
             # Reap when the caller is long-lived, but never keep a command hook
             # alive waiting for HTTP recovery. The worker owns the inherited fd.
             threading.Thread(target=process.wait, daemon=True).start()
+            # Do not re-read another caller's config in the detached process.
+            # The destination crosses an anonymous pipe, never argv or disk.
+            process.stdin.write(json.dumps(target).encode())
+            process.stdin.close()
         finally:
             # Do not LOCK_UN here: flock ownership is shared with the child.
             os.close(descriptor)
@@ -330,37 +331,43 @@ class Runtime:
                 self._cancel_delivery(session_id)
                 return
             owner = state.get("owner")
-            if self.background_delivery:
+            target = self.transport.notification_target() if self.background_delivery else None
+            if target and target["topic"] is not None:
                 generation = digest([owner, state["revision"], notices])
-                with locked(self.root / "delivery-control.lock"):
-                    queue = self.root / "delivery-queue.json"
+                with locked(self.root / "delivery-control-v2.lock"):
+                    queue = self.root / "delivery-queue-v2.json"
                     jobs = load_json(queue, {})
                     key = digest(session_id)
                     previous = jobs.get(key, {})
                     # Re-admission must fence a worker that already observed a
                     # closed review gate, even for the same owner/turn/generation.
                     jobs[key] = {"session_id": session_id, "owner": owner, "generation": generation,
-                                 "admission": uuid.uuid4().hex,
-                                 "nextAttemptAt": previous.get("nextAttemptAt", 0)
-                                 if previous.get("generation") == generation else 0}
+                                  "admission": uuid.uuid4().hex, "route": digest(target),
+                                  "nextAttemptAt": previous.get("nextAttemptAt", 0)
+                                  if previous.get("generation") == generation and previous.get("route") == digest(target) else 0}
                     save_json(queue, jobs)
-                    self._start_delivery_worker()
+                    self._start_delivery_worker(target)
                 return
+            self._cancel_delivery(session_id)
         self.deliver_pending(session_id, owner)
 
     def delivery_worker(self, descriptor):
-        """One detached worker per state directory, only while admitted work remains.
+        """One detached worker per destination, only while its admitted work remains.
 
         Queue entries contain metadata, never notification text or transport
         configuration. Retry time does not grant admission: deliver_pending and
         Transport.current re-read all lifecycle/owner/review gates before HTTP.
         """
-        queue = self.root / "delivery-queue.json"
+        target = self.transport.notification_target()
+        route = digest(target)
+        delivery_transport = Transport(self.root, **target)
+        # A distinct queue also fences pre-publication workers that lack routing.
+        queue = self.root / "delivery-queue-v2.json"
         try:
             while True:
                 try:
-                    with locked(self.root / "delivery-control.lock"):
-                        jobs = load_json(queue, {})
+                    with locked(self.root / "delivery-control-v2.lock"):
+                        jobs = {key: job for key, job in load_json(queue, {}).items() if job.get("route") == route}
                         if not jobs:
                             # Serialize exit with enqueue + spawn. A newly queued job
                             # cannot mistake this exiting worker for a live owner.
@@ -373,10 +380,10 @@ class Runtime:
                             wake_at = min(wake_at, job["nextAttemptAt"])
                             continue
                         try:
-                            due = self.deliver_pending(job["session_id"], job["owner"])
+                            due = self.deliver_pending(job["session_id"], job["owner"], job, delivery_transport)
                         except (OSError, ValueError, TypeError, TimeoutError):
                             due = time.time() + 30
-                        with locked(self.root / "delivery-control.lock"):
+                        with locked(self.root / "delivery-control-v2.lock"):
                             latest = load_json(queue, {})
                             if latest.get(key) != job:
                                 continue  # Cancellation/new generation won the race.
@@ -398,10 +405,13 @@ class Runtime:
             if descriptor is not None:
                 os.close(descriptor)
 
-    def deliver_pending(self, session_id, owner):
+    def deliver_pending(self, session_id, owner, admission=None, transport=None):
+        def admitted():
+            return admission is None or load_json(self.root / "delivery-queue-v2.json", {}).get(digest(session_id)) == admission
+
         with locked(self.path(session_id).with_suffix(".lock")):
             state = self._load(session_id)
-            if state.get("owner") != owner:
+            if state.get("owner") != owner or not admitted():
                 return
             notices = self._notices(state)
         next_attempt = None
@@ -416,13 +426,13 @@ class Runtime:
                 with locked(self.path(session_id).with_suffix(".lock")):
                     latest = self._load(session_id)
                     pane = self._pane_path(latest.get("herdr", {}))
-                    return (latest.get("owner") == owner and (kind, notice_id) in self._notices(latest)
+                    return (admitted() and latest.get("owner") == owner and (kind, notice_id) in self._notices(latest)
                             and (not pane or load_json(pane, {}).get("owner") == owner))
-            receipt = self.transport.publish(session_id=session_id, kind=kind, notice_id=notice_id,
-                                             message=message, is_current=current)
+            receipt = (transport or self.transport).publish(session_id=session_id, kind=kind, notice_id=notice_id,
+                                                           message=message, is_current=current)
             with locked(self.path(session_id).with_suffix(".lock")):
                 latest = self._load(session_id)
-                if latest.get("owner") != owner or (kind, notice_id) not in self._notices(latest):
+                if not admitted() or latest.get("owner") != owner or (kind, notice_id) not in self._notices(latest):
                     continue
                 if receipt.get("status") in ("sent", "duplicate", "disabled") or receipt.get("terminal"):
                     # A permanent HTTP rejection is settled, never called sent.
@@ -734,7 +744,9 @@ def finish_hook(hook_input, hook_id, run_id, exit_code):
 if __name__ == "__main__":
     try:
         if len(sys.argv) == 3 and sys.argv[1] == "--delivery-worker":
-            default_runtime().delivery_worker(int(sys.argv[2]))
+            root = Path(os.environ["CLAUDE_TASK_LIFECYCLE_STATE_DIR"])
+            target = json.loads(sys.stdin.read(2_000_000))
+            Runtime(root, Transport(root, **target)).delivery_worker(int(sys.argv[2]))
         elif len(sys.argv) == 4 and sys.argv[1] == "--deliver":
             default_runtime().deliver_pending(sys.argv[2], sys.argv[3])
         else:

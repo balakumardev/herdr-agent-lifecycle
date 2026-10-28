@@ -197,6 +197,11 @@ needed. Only the release job has write access. Pipelines are serialized and the
 release uses its tested commit. Generated release commits use `[skip ci]`.
 Re-running a completed release with no new commits creates no new version.
 Use the workflow's manual dispatch to retry a failed run after fixing its cause.
+Before version analysis, recovery checks the latest reachable release tag. If
+GitHub publication was interrupted after tagging, it rebuilds that exact tag in
+a disposable clone, completes its draft assets, verifies downloaded checksums,
+and publishes that same version. A completed release is verified without being
+rewritten. The release job also verifies downloaded assets after publication.
 
 If you later protect `main`/`master` against release commits, configure an
 appropriately scoped GitHub App for the release job. Do not substitute a broad

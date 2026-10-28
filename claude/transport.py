@@ -133,12 +133,8 @@ class Transport:
         except (urllib.error.URLError, OSError, ValueError):
             return {"reason": "network"}
 
-    def publish(self, *, session_id, kind, notice_id, message=None, is_current=lambda: True):
-        # Keys are opaque ids, never prompt, question, tool, or response bodies.
-        key = hashlib.sha256(json.dumps([session_id, kind, notice_id]).encode()).hexdigest()
-        receipt = {"keyHash": key, "time": datetime.now(timezone.utc).isoformat(), "event": kind}
-        if kind not in ("question", "done") or not session_id or not notice_id:
-            return {**receipt, "status": "disabled", "reason": "invalid_event"}
+    def notification_target(self):
+        """Resolve an immutable destination without persisting the private topic."""
         topic = self.topic
         if self.topic_file is not None:
             try:
@@ -148,6 +144,17 @@ class Transport:
             match = re.search(r"^\s*TOPIC=(?:\"([A-Za-z0-9_-]+)\"|'([A-Za-z0-9_-]+)'|([A-Za-z0-9_-]+))\s*(?:#.*)?$", source, re.M)
             topic = next((value for value in match.groups() if value), None) if match else None
         if not isinstance(topic, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", topic):
+            topic = None
+        return {"endpoint": self.endpoint, "topic": topic}
+
+    def publish(self, *, session_id, kind, notice_id, message=None, is_current=lambda: True):
+        # Keys are opaque ids, never prompt, question, tool, or response bodies.
+        key = hashlib.sha256(json.dumps([session_id, kind, notice_id]).encode()).hexdigest()
+        receipt = {"keyHash": key, "time": datetime.now(timezone.utc).isoformat(), "event": kind}
+        if kind not in ("question", "done") or not session_id or not notice_id:
+            return {**receipt, "status": "disabled", "reason": "invalid_event"}
+        topic = self.notification_target()["topic"]
+        if topic is None:
             return {**receipt, "status": "disabled", "reason": "no_topic"}
         sent = self.state_dir / "deliveries" / (key + ".json")
         try:
