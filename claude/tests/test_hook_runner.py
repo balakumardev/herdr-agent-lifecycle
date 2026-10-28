@@ -103,6 +103,12 @@ class HookRunnerTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, raw, b""))
         self.assertEqual(self.records()[-1]["input"], {})
 
+    def test_deep_object_serialization_cannot_prevent_original_execution(self):
+        raw = b'{"nested":' * 2000 + b'0' + b'}' * 2000
+        result = self.run_hook("--", sys.executable, "-c",
+                               "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())", payload=raw)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, raw, b""))
+
     def test_runtime_import_or_callback_failure_cannot_change_original_result(self):
         for failure in ("begin", "finish", "import"):
             with self.subTest(failure=failure):
@@ -167,7 +173,7 @@ class HookRunnerTests(unittest.TestCase):
         process.send_signal(signal.SIGTERM)
         process.communicate(timeout=5)
         self.assertNotEqual(process.returncode, 0)
-        self.assertEqual((self.root / "signalled").read_text(), str(signal.SIGTERM))
+        self.assertEqual((self.root / "signalled").read_text(), str(int(signal.SIGTERM)))
         self.assertEqual(self.records()[-1]["operation"], "finish")
         self.assertNotEqual(self.records()[-1]["exit_code"], 0)
 

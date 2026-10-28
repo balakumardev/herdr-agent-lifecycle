@@ -46,7 +46,7 @@ def record(operation, hook_input, hook_id, run_id="", exit_code=0):
                                 start_new_session=True, check=False)
         if operation == "begin" and result.returncode == 0 and result.stdout:
             return json.loads(result.stdout)
-    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, TypeError, RecursionError, subprocess.TimeoutExpired):
         pass
     return ""
 
@@ -142,7 +142,7 @@ def main(argv=None):
         hook_input = json.loads(raw)
         if not isinstance(hook_input, dict):
             hook_input = {}
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         hook_input = {}
     return run_command(command, raw, hook_input, args.id)
 
