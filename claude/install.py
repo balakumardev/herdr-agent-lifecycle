@@ -28,7 +28,8 @@ OPTIONAL_ARTIFACTS = ("README.md", "tests/verify_live_cli.py",
 PUBLIC_TEST_PATTERNS = ("tests/test_*.py", "tests/*.test.ts", "tests/*.test.js",
                         "tests/live-fixture/*.py", "tests/live-fixture/hooks/*.js")
 MAX_FILE_BYTES = 16 * 1024 * 1024
-MINIMUM_CLAUDE_VERSION = "2.1.287"
+MINIMUM_CLAUDE_VERSION = "2.1.292"
+MARKETPLACE = "herdr-agent-lifecycle"
 
 
 class InstallError(Exception):
@@ -63,6 +64,37 @@ def read_json(path):
 
 def json_bytes(value):
     return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode()
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest() if data is not None else None
+
+
+def restore_hooks(current, patches):
+    """Reverse only migrated records; unrelated settings are never in backups."""
+    restored = copy.deepcopy(current)
+    groups = {}
+    for patch in patches:
+        key = (tuple(patch.get("definition_path", [])), patch["event"], patch["group_index"])
+        groups.setdefault(key, []).append(patch)
+    for (location, event, group_index), records in sorted(groups.items()):
+        definition = restored
+        for part in location:
+            definition = definition[part]
+        hook_map = definition.get("hooks", definition)
+        event_groups = hook_map[event]
+        if records[0]["group_removed"]:
+            event_groups.insert(group_index, {**records[0]["group_fields"], "hooks": []})
+        hooks = event_groups[group_index]["hooks"]
+        for record in sorted(records, key=lambda item: item["hook_index"]):
+            index = record["hook_index"]
+            if record["wrapped"] is None:
+                hooks.insert(index, record["original"])
+            else:
+                if hooks[index] != record["wrapped"]:
+                    raise InstallError("a migrated hook changed; refusing to restore it")
+                hooks[index] = record["original"]
+    return restored
 
 
 def confined(path, root):
@@ -266,6 +298,7 @@ class Installation:
         self.wrapped = 0
         self.removed = 0
         self.native_rewake = {}
+        self.backup = None
 
     def change(self, path, data, mode=None, patches=None):
         confined(path, self.claude)
@@ -297,6 +330,7 @@ class Installation:
                 retained = []
                 for group_index, group in enumerate(groups):
                     kept = []
+                    patch_start = len(patches)
                     for hook_index, hook in enumerate(group["hooks"]):
                         after = hook
                         if user and legacy_registration(hook, event, self.home):
@@ -317,14 +351,17 @@ class Installation:
                                 self.wrapped += after != hook
                         if after != hook:
                             patch = {"event": event, "matcher": group.get("matcher"),
-                                     "group_index": group_index, "hook_index": hook_index,
-                                     "original": hook, "wrapped": after}
+                                      "group_index": group_index, "hook_index": hook_index,
+                                      "group_fields": {k: copy.deepcopy(v) for k, v in group.items() if k != "hooks"},
+                                      "original": hook, "wrapped": after}
                             if location:
                                 patch["definition_path"] = list(location)
                             patches.append(patch)
                         if after is not None:
                             kept.append(after)
                     # Preserve pre-existing empty groups, but remove groups emptied by this migration.
+                    for patch in patches[patch_start:]:
+                        patch["group_removed"] = bool(group["hooks"] and not kept)
                     if kept or not group["hooks"]:
                         group["hooks"] = kept
                         retained.append(group)
@@ -345,7 +382,7 @@ class Installation:
             mode = 0o700 if relative.endswith(".py") else 0o600
             self.change(self.target / relative, data, mode)
             self.change(self.market / "plugins/task-lifecycle" / relative, data, mode)
-        marketplace = {"name": "local-task-lifecycle", "owner": {"name": "Local user"},
+        marketplace = {"name": MARKETPLACE, "owner": {"name": "balakumardev"},
                        "plugins": [{"name": "task-lifecycle", "source": "./plugins/task-lifecycle"}]}
         self.change(self.market / ".claude-plugin/marketplace.json", json_bytes(marketplace), 0o600)
 
@@ -375,37 +412,79 @@ class Installation:
         backups.chmod(0o700)
         backup = backups / uuid.uuid4().hex
         backup.mkdir(mode=0o700)
+        self.backup = backup
         records = []
         for index, change in enumerate(self.changes):
             record = {"file": str(change["path"]), "existed": change["old"] is not None,
-                      "mode": change["old_mode"]}
+                       "mode": change["old_mode"], "installed_mode": change["mode"],
+                       "before_hash": digest(change["old"]), "after_hash": digest(change["data"])}
             if change["patches"] is not None:
                 # Never copy env/API keys or unrelated hook registrations out of settings.
                 record["changes"] = change["patches"]
+                record["before_json_hash"] = digest(json_bytes(json.loads(change["old"])))
             elif change["old"] is not None:
                 name = str(index) + ".original"
                 atomic_write(backup / name, change["old"], 0o600)
                 record["backup"] = name
             records.append(record)
-        atomic_write(backup / "backup.json", json_bytes({"version": 1, "files": records}), 0o600)
+        atomic_write(backup / "backup.json", json_bytes({"version": 2, "home": str(self.home), "files": records}), 0o600)
         # Complete all private backups before the first replacement; reject a concurrent config edit.
         if any(read_bytes(c["path"]) != c["old"] for c in self.changes):
             raise InstallError("configuration changed during installation; rerun to replan")
         for change in self.changes:
             atomic_write(change["path"], change["data"], change["mode"])
 
+    def restore(self, backup, apply=False):
+        backup = backup.expanduser().resolve()
+        confined(backup, self.target / "backups")
+        metadata = read_json(backup / "backup.json")
+        if metadata.get("version") != 2 or metadata.get("home") != str(self.home):
+            raise InstallError("backup belongs to another installation or needs manual restoration")
+        for record in metadata["files"]:
+            path = confined(Path(record["file"]), self.claude)
+            current = read_bytes(path)
+            if digest(current) == record["before_hash"]:
+                continue
+            if record.get("before_json_hash") and current is not None:
+                if digest(json_bytes(json.loads(current))) == record["before_json_hash"]:
+                    continue
+            if (digest(current) != record["after_hash"]
+                    or stat.S_IMODE(path.stat().st_mode) != record["installed_mode"]):
+                raise InstallError("a file changed after installation; no files restored")
+            if "changes" in record:
+                original = json_bytes(restore_hooks(json.loads(current), record["changes"]))
+                if digest(original) != record["before_json_hash"]:
+                    raise InstallError("restored hooks do not match the original configuration")
+            elif record["existed"]:
+                original = read_bytes(confined(backup / record["backup"], backup))
+                if digest(original) != record["before_hash"]:
+                    raise InstallError("backup checksum does not match")
+            else:
+                original = None
+            self.changes.append({"path": path, "old": current, "data": original, "mode": record["mode"]})
+        if apply:
+            if any(read_bytes(c["path"]) != c["old"] for c in self.changes):
+                raise InstallError("configuration changed during restore; no files restored")
+            for change in self.changes:
+                if change["data"] is None:
+                    change["path"].unlink()
+                else:
+                    atomic_write(change["path"], change["data"], change["mode"])
+
     def report(self, applied):
         return {"mode": "apply" if applied else "dry-run", "changed_files": len(self.changes),
                 "wrapped_hooks": self.wrapped, "tracked_hooks": len(self.wrappers),
-                "removed_hooks": self.removed, "minimum_claude_version": MINIMUM_CLAUDE_VERSION,
-                "commands": ["claude plugin marketplace add " + shlex.quote(str(self.market)),
-                             "claude plugin install task-lifecycle@local-task-lifecycle --scope user"]}
+                 "removed_hooks": self.removed, "minimum_claude_version": MINIMUM_CLAUDE_VERSION,
+                 "backup_directory": str(self.backup) if self.backup else None,
+                 "commands": ["claude plugin marketplace add " + shlex.quote(str(self.market)),
+                              "claude plugin install task-lifecycle@" + MARKETPLACE + " --scope user"]}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path.home())
     parser.add_argument("--source-dir", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument("--restore", type=Path, help="Reverse a backup, refusing later edits; defaults to dry-run")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
@@ -414,15 +493,21 @@ def main(argv=None):
         installation = Installation(args.home, args.source_dir)
         if args.apply:
             with locked(installation.target / ".install.lock"):
-                installation.plan()
-                installation.apply()
+                if args.restore:
+                    installation.restore(args.restore, apply=True)
+                else:
+                    installation.plan()
+                    installation.apply()
         else:
-            installation.plan()
+            if args.restore:
+                installation.restore(args.restore)
+            else:
+                installation.plan()
         print(json.dumps(installation.report(args.apply)))
         return 0
     except InstallError as error:
         print(json.dumps({"error": str(error)}))
-    except (OSError, ValueError, TypeError, TimeoutError):
+    except (OSError, ValueError, TypeError, KeyError, IndexError, TimeoutError):
         print(json.dumps({"error": "installation failed; inspect file access and configuration locally"}))
     return 1
 

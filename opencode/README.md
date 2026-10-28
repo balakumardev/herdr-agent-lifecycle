@@ -1,6 +1,6 @@
 # OpenCode V2 task lifecycle integration
 
-Native V2 session-tree state for Herdr and ntfy on this Linux shared-service setup.
+Native V2 session-tree state for Herdr and optional ntfy on macOS and Linux.
 
 ## Behavior
 
@@ -12,7 +12,7 @@ Native V2 session-tree state for Herdr and ntfy on this Linux shared-service set
 - Opening an already completed session does not replay historical completion alerts.
 - Descendants can live in different directories/worktrees. The pane remains attributed to its root.
 
-### Delivery retries (1.0.2)
+### Delivery retries
 
 Each admission makes at most one HTTP request. Failed transient requests back off exponentially (30 seconds up to 15 minutes, plus up to 20% jitter). HTTP 429 waits at least 60 seconds. `Retry-After` seconds and HTTP dates are honored when they require a longer wait. A persisted endpoint-wide cooldown covers all sessions in this integration, including concurrent publishers and newly created notifier instances. Non-retryable HTTP errors are recorded as terminal failures for that notice, never as successful deliveries.
 
@@ -26,43 +26,60 @@ Claim-numbered retry records keep expired publishers from overwriting newer cool
 - `monitor.mjs`: event invalidation, snapshot reconciliation, and notification admission.
 - `index.js`: one authenticated monitor per OpenCode service process, shared across location instances; exposes `local.task-lifecycle/snapshot` RPC.
 - `tui.js` / `herdr.mjs`: selected-root reporting using the terminal's own Herdr pane environment.
-- `notify.mjs`: literal topic lookup, bounded HTTP delivery, persistent concurrent deduplication, and sanitized receipts.
+- `config.mjs`: the shared public configuration schema.
+- `notify.mjs`: bounded HTTP delivery, persistent concurrent deduplication, and sanitized receipts.
 
 The service is discovered through `@opencode/client/service`. Discovery never launches a service. Its PID must match the plugin host, so a standalone server cannot accidentally report another shared server's sessions.
 
 ## Configuration
 
-Effective server configuration: `~/.config/opencode2/opencode/opencode.json`.
+Effective server configuration: `~/.config/opencode/opencode.json` (or the
+`opencode/` directory under `$XDG_CONFIG_HOME`). Use the [installer](../README.md#opencode)
+to merge a dependency-complete release. Its resulting plugin entries are:
 
 ```json
 {
   "plugins": [
     "-herdr.opencode.agent-state",
-    { "package": "./plugins/claude-code-hooks.js", "options": { "notifications": false } },
-    "./integrations/task-lifecycle"
+    "/absolute/release/path/opencode"
   ]
 }
 ```
 
-These entries are merged with the existing plugins. The portable Claude hooks retain their audit/context/lint functionality; this integration owns V2 attention. The compatibility bridge also defaults its V2 notifier to off, covering automatically discovered instances that have no explicit options. Legacy notification behavior is available only through an explicit `notifications:true` override.
+These entries are merged with existing plugins. If a recognized legacy Claude
+notification bridge is present, the installer transfers its notification role
+to this integration while retaining its audit/context/lint behavior.
 
-Effective terminal configuration: `~/.config/opencode2/opencode/cli.json`, with `./integrations/task-lifecycle` in `plugins`. The custom Herdr agent label is `opencode-v2`, with a resumable `opencode2 --session <rootID>` command.
+Terminal configuration is `~/.config/opencode/cli.json`, with
+`"-herdr.opencode.session-selection"` and the same absolute plugin directory in
+`plugins`. The custom Herdr agent label is `opencode-v2`; the resume executable
+defaults to `opencode` and is configurable through `opencode.command` in the
+[shared settings file](../README.md#configuration).
 
 ## Diagnostics
 
 ```bash
-opencode2 api post '/api/rpc/local.task-lifecycle/snapshot?location[directory]=/home/coder/workspace/command-center' \
+opencode api post '/api/rpc/local.task-lifecycle/health' --data '{"input":{}}'
+opencode api post '/api/rpc/local.task-lifecycle/snapshot' \
   --data '{"input":{"sessionID":"<sessionID>"}}'
 herdr agent explain '<paneID>' --json
 ```
 
-ntfy reads `TOPIC` from `~/.claude/hooks/ntfy-notify.sh` without executing that script. Receipts are at `$XDG_STATE_HOME/opencode/task-lifecycle/receipts.jsonl` (normally `~/.local/state/opencode2/opencode/task-lifecycle/receipts.jsonl`). They contain hashed event keys, HTTP status and delivery outcome, without the topic or message contents. HTTP acceptance verifies publication; device alerts also depend on the subscribing app.
+Notifications use the shared settings file and are disabled by default. Receipts
+are at `$XDG_STATE_HOME/opencode/task-lifecycle/receipts.jsonl` (normally
+`~/.local/state/opencode/task-lifecycle/receipts.jsonl`). They contain hashed event
+keys, HTTP status and delivery outcome. HTTP acceptance verifies publication;
+device alerts also depend on the subscribing app.
 
-The `local.task-lifecycle/health` RPC returns the loaded integration version/build revision, monitor readiness and location reference count. This repair is **version 1.0.2, revision 3**. A receipt with `retryAt` means delivery is waiting, not acknowledged. Terminal failures (such as HTTP 401/403) require correcting the endpoint/auth problem; future notices use new keys.
+The `local.task-lifecycle/health` RPC returns the loaded version/build revision,
+monitor readiness and location reference count. A receipt with `retryAt` means
+delivery is waiting. Terminal failures (such as HTTP 401/403) require correcting
+the endpoint/auth problem; future notices use new keys.
 
 ## Verification
 
-Run `npm test` in this directory. Tests use temporary Unix sockets and local HTTP servers; they do not send external notifications. The existing question-timeout tests remain at `../../tests/question-timeout-effect.test.mjs`.
+Run `npm test` from the repository root. Tests use temporary Unix sockets and
+local HTTP servers, including the packaged legacy-bridge fixture.
 
 ## Applying source updates on the shared service
 
@@ -70,4 +87,5 @@ Run `npm test` in this directory. Tests use temporary Unix sockets and local HTT
 
 After updating source, trigger a watched plugin-config reload and verify `local.task-lifecycle/health` reports the new version, then check a real diagnostic completion. Editing an unwatched imported file alone is not proof of activation. If a restart is used instead, schedule it after active work finishes. Startup hydration continues to suppress historical completion alerts.
 
-Original configuration and compatibility-hook backups are under `~/.local/state/opencode2/opencode/task-lifecycle/backups/20261006T113044Z/`. For rollback, remove this package from the two configuration files, remove the old Herdr disable directive, and remove the `notifications:false` override. Restore only the affected entries so unrelated later config changes are retained.
+The installer prints a private backup directory and supports guarded
+`--restore BACKUP --apply`. See [upgrade and rollback](../README.md#upgrade-and-rollback).

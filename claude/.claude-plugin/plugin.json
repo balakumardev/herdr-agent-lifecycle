@@ -2,5 +2,9 @@
   "name": "task-lifecycle",
   "version": "1.0.4",
   "description": "Child-aware Herdr state and completion/question notifications for Claude Code",
-  "author": { "name": "Local configuration" }
+  "author": { "name": "balakumardev", "url": "https://github.com/balakumardev" },
+  "homepage": "https://github.com/balakumardev/herdr-agent-lifecycle",
+  "repository": "https://github.com/balakumardev/herdr-agent-lifecycle",
+  "license": "Apache-2.0",
+  "keywords": ["herdr", "notifications", "lifecycle", "subagents"]
 }

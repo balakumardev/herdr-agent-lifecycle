@@ -183,11 +183,11 @@ class InstallTests(unittest.TestCase):
     def test_stages_local_marketplace_without_migrating_private_files(self):
         self.run_installer("--apply")
         marketplace = json.loads((self.market / ".claude-plugin/marketplace.json").read_text())
-        self.assertEqual(marketplace["name"], "local-task-lifecycle")
+        self.assertEqual(marketplace["name"], "herdr-agent-lifecycle")
         entry = marketplace["plugins"][0]
         self.assertEqual(entry["name"], "task-lifecycle")
         stage = self.market / entry["source"]
-        for relative in ("runtime.py", "transport.py", "bash_conditions.py", "hook_runner.py", "event_hook.py", "install.py",
+        for relative in ("runtime.py", "transport.py", "configuration.py", "bash_conditions.py", "hook_runner.py", "event_hook.py", "install.py",
                          ".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.js"):
             self.assertTrue((stage / relative).is_file(), "required plugin entrypoint was not staged: " + relative)
             self.assertEqual((stage / relative).read_bytes(), (self.source / relative).read_bytes())
@@ -201,8 +201,72 @@ class InstallTests(unittest.TestCase):
         report = self.run_installer("--dry-run")
         self.assertEqual(report["commands"], [
             "claude plugin marketplace add " + shlex.quote(str(self.market)),
-            "claude plugin install task-lifecycle@local-task-lifecycle --scope user"])
-        self.assertEqual(report["minimum_claude_version"], "2.1.287")
+            "claude plugin install task-lifecycle@herdr-agent-lifecycle --scope user"])
+        self.assertEqual(report["minimum_claude_version"], "2.1.292")
+
+    def test_restore_recovers_owned_hooks_and_files_without_copying_private_settings(self):
+        self.settings["hooks"]["SessionEnd"] = [{"matcher": "exit", "custom": True, "hooks": [
+            {"type": "command", "command": "bash " + shlex.quote(str(self.claude / "hooks/herdr-agent-state.sh"))}]}]
+        write_json(self.settings_path, self.settings)
+        self.settings_path.chmod(0o640)
+        report = self.run_installer("--apply")
+        backup = report["backup_directory"]
+        self.assertIsInstance(backup, str)
+        self.run_installer("--restore", backup, "--apply")
+        self.assertEqual(json.loads(self.settings_path.read_text()), self.settings)
+        self.assertEqual(json.loads(self.plugin_path.read_text()), self.plugin_config)
+        self.assertEqual(self.settings_path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.shim.read_text(), self.original_shim)
+        self.assertFalse((self.target / "runtime.py").exists())
+        self.assertFalse((self.market / ".claude-plugin/marketplace.json").exists())
+        for path in Path(backup).rglob("*"):
+            if path.is_file():
+                self.assertNotIn(PRIVATE.encode(), path.read_bytes())
+
+    def test_restore_refuses_every_change_if_one_hook_file_was_edited_later(self):
+        report = self.run_installer("--apply")
+        with self.plugin_path.open("a") as output:
+            output.write("\n")
+        before = snapshot(self.root)
+        self.run_installer("--restore", report["backup_directory"], "--apply", success=False)
+        self.assertEqual(snapshot(self.root), before)
+
+    def test_restore_is_dry_run_by_default_and_idempotent_after_applying(self):
+        report = self.run_installer("--apply")
+        backup = report["backup_directory"]
+        before = snapshot(self.root)
+        self.run_installer("--restore", backup)
+        self.assertEqual(snapshot(self.root), before)
+        self.run_installer("--restore", backup, "--apply")
+        restored = snapshot(self.root)
+        self.assertEqual(self.run_installer("--restore", backup, "--apply")["changed_files"], 0)
+        self.assertEqual(snapshot(self.root), restored)
+
+    def test_restore_reconstructs_removed_and_partial_groups_in_original_order(self):
+        legacy = {"type": "command", "command": shlex.quote(str(self.shim))}
+        self.settings["hooks"]["Stop"] = [
+            {"matcher": "a", "custom": 1, "hooks": [legacy, legacy]},
+            {"matcher": "b", "hooks": [legacy, self.async_shell, legacy, self.audit]},
+            {"matcher": "c", "hooks": [legacy]},
+            {"matcher": "d", "hooks": [self.async_exec]},
+        ]
+        write_json(self.settings_path, self.settings)
+        report = self.run_installer("--apply")
+        self.run_installer("--restore", report["backup_directory"], "--apply")
+        self.assertEqual(json.loads(self.settings_path.read_text()), self.settings)
+
+    def test_restore_reverses_custom_and_inline_plugin_hook_patches(self):
+        manifest_path = self.plugin / ".claude-plugin/plugin.json"
+        custom_path = self.plugin / "custom.json"
+        custom = {"Stop": [{"hooks": [self.plugin_hook]}]}
+        metadata = {"name": "reviewer", "env": {"TOKEN": PRIVATE}, "hooks": [
+            "./custom.json", {"description": "Inline", "hooks": custom}]}
+        write_json(custom_path, custom)
+        write_json(manifest_path, metadata)
+        report = self.run_installer("--apply")
+        self.run_installer("--restore", report["backup_directory"], "--apply")
+        self.assertEqual(json.loads(custom_path.read_text()), custom)
+        self.assertEqual(json.loads(manifest_path.read_text()), metadata)
 
     def test_optional_public_verification_artifacts_are_runnable_after_staging(self):
         public = {

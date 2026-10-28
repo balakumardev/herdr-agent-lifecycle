@@ -1,0 +1,13 @@
+{
+  "name": "herdr-agent-lifecycle",
+  "owner": { "name": "balakumardev", "url": "https://github.com/balakumardev" },
+  "metadata": { "description": "Task-aware Herdr reporting for coding agents" },
+  "plugins": [
+    {
+      "name": "task-lifecycle",
+      "source": "./claude",
+      "description": "Child-aware Herdr state and optional completion/question notifications",
+      "version": "1.0.4"
+    }
+  ]
+}

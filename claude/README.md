@@ -1,12 +1,12 @@
 # Claude Code task lifecycle
 
-Child-aware Herdr status and ntfy attention for the Claude CLI, including `ccf` / `ccs` when they use the same Claude configuration directory. Native validation and unit tests target Claude Code **2.1.292** on Linux. The Python helpers use only the standard library and POSIX file locks, and are portable to macOS with Python 3.9+.
+Child-aware Herdr status and optional ntfy attention for Claude Code. Native validation and tests target Claude Code **2.1.292+**, with fresh validation on **2.1.311**. The Python helpers use only the standard library and POSIX file locks on Linux and macOS with Python 3.9+.
 
 ## Behavior
 
 - **Working:** the parent, subagents, native background tasks, recurring session jobs, background reviews, or an expected continuation remain.
 - **Blocked:** an actual user question, a permission request, or an interrupted/failed turn. Only a displayed, still-pending **AskUserQuestion** sends an ntfy input-needed alert.
-- **Done:** a final successful native parent turn after all observed work and security reviews settle. Its native Stop work snapshot must be empty, or contain only reusable teammates accepted by the best-effort observed-idle rule below. One completion notification is admitted per turn.
+- **Done:** a final successful native parent turn after all observed work and security reviews settle. Its native Stop work snapshot must be empty. The best-effort observed-idle rule below requires an explicit opt-in. One completion notification is admitted per turn when notifications are enabled.
 - The completion notification body is that final **parent assistant reply**, UTF-8-truncated to 4000 bytes when necessary, with `…` marking truncation.
 - A child finishing, an idle reminder, a session exit, and reopening an old conversation do not independently qualify as completion.
 - An unavailable task snapshot or uninstrumented asynchronous review keeps completion pending.
@@ -21,7 +21,8 @@ Question alerts wait 750 ms and recheck the matching live tool call. Quickly ans
 - `hook_runner.py`: transparent wrapper around asynchronous rewake producers; preserves their input, output, exit code, and configuration. It records a pending continuation **before** returning exit 2 to Claude.
 - `transport.py`: pane-specific Unix-socket Herdr reporting, durable ntfy backoff, endpoint-wide serialization, persistent concurrent deduplication, and sanitized receipts.
 - `bash_conditions.py`: conservative native-compatible matching for literal Bash hook conditions.
-- `install.py`: merge-only deployment and private backups.
+- `configuration.py`: shared public configuration, with notifications disabled and strict teammate handling by default.
+- `install.py`: scoped installation, private backups, and guarded restoration.
 
 ### Why both kinds of hooks?
 
@@ -29,21 +30,26 @@ Claude's built-in `sec-default` policy deliberately skips user-tier native `clas
 
 Native `background_tasks` **does not include `asyncRewake` command hooks**. Those producers require separate acknowledgements. The installer wraps the enabled user-owned producers and the runtime reserves expected reviews before admitting completion. Wrappers that start before the snapshot are reconciled into the same invocation. Plugin upgrades that replace wrappers need a fresh installation/audit.
 
-### Reusable named teammates: best-effort observed idle
+### Reusable named teammates: strict by default
+
+With the default `claude.allowIdleTeammates: false`, a nonempty teammate Stop
+snapshot remains Working (`teammate_completion_unproven`). Finish the team's
+background work and let the parent reconcile in a fresh turn. The following
+fallback applies only when `allowIdleTeammates` is explicitly the boolean `true`.
 
 Claude's native Stop snapshot can retain a reusable named teammate with `type=teammate` and lifetime `status=running` after its work finishes. At root completion admission, after the existing 500 ms interactive quiet period, the native observer reads a fresh `$.agent.list()` roster and forwards only `id`, `teammateId`, and `status`. New activity or an owner change during that read cancels admission.
 
 The original empty-Stop path is unchanged. A nonempty Stop qualifies only when every record is a valid running teammate with a distinct task ID, session crons are explicitly empty, and the observed queue is not explicitly nonempty. The fresh roster must contain only `idle`, `completed`, `failed`, or `aborted` agents, including locally resumable idle teammates with distinct identities and `id != teammateId`. Their count must match the native teammate count. Missing or failed roster reads, pending/running/waiting/unknown statuses, ambiguous identities/counts, and nonlocal fallback identities keep completion pending.
 
-**This is not proof that teammate queues are empty.** Public `idle` can coexist with unseen queued teammate messages, so this rule can produce premature Herdr Idle or a Done notification. The integration deliberately accepts that best-effort trade-off. Count equality is only a conservative sanity check: native task IDs are not joined to public agent IDs, names, or descriptions.
+**This is not proof that teammate queues are empty.** Public `idle` can coexist with unseen queued teammate messages, so this opt-in rule can produce premature Herdr Idle or a Done notification. Count equality is only a conservative sanity check: native task IDs are not joined to public agent IDs, names, or descriptions.
 
 Observed child work, shell/workflow tasks, crons, questions, permissions, continuations, and asynchronous security reviews still block completion. The exception does not settle or bypass any review.
 
 ### Background reviews remain asynchronous
 
-The user chose **Keep background reviews** on 2026-10-06. Conditional commit/push reviews keep their original `if` and `asyncRewake` configuration.
+Conditional commit/push reviews keep their original `if` and `asyncRewake` configuration.
 
-Version **1.0.3** fixes false permanent Working states caused by treating every multiline Bash input as unknown. The matcher handles a closed literal subset: command lists/chains, pipelines, shell quoting, literal assignments, redirections and quoted heredocs. Git commands later in a chain still require their configured review; literal Git text inside a quoted heredoc does not create one.
+The matcher handles a closed literal subset: command lists/chains, pipelines, shell quoting, literal assignments, redirections and quoted heredocs. Git commands later in a chain still require their configured review; literal Git text inside a quoted heredoc does not create one.
 
 Native raw-text refusal checks run before comments or heredoc bodies are discarded. Equals-expansion forms, brace/quote ambiguity, certain backslash-newline sequences and invisible whitespace retain the unknown gate, including when such text occurs inside a comment or heredoc. These checks were validated against both native binaries; they must not be replaced with a blanket first-word check.
 
@@ -94,7 +100,7 @@ herdr agent explain "$HERDR_PANE_ID" --json
 
 The authority is `custom:claude-task-lifecycle`. Receipts live under `$XDG_STATE_HOME/claude/task-lifecycle/receipts.jsonl`, defaulting to `~/.local/state/claude/task-lifecycle/receipts.jsonl`. Receipt fields contain a hashed key, event kind, timestamp, numeric HTTP status, attempt count, retry deadline, terminal flag, and delivery outcome. Prompt text, questions, commands, response bodies, URLs, and the private ntfy topic are excluded. `deliveries/` holds the per-notice delivery/backoff records; `endpoints/` holds hashed endpoint cooldowns. `delivery-queue.json` contains pending session/owner/generation/admission identifiers and retry times only.
 
-Both this integration and the OpenCode V2 integration read the literal `TOPIC=` assignment in `~/.claude/hooks/ntfy-notify.sh`. They do not execute it. The installed compatibility shim retains that assignment and absorbs legacy hook calls.
+Both integrations read the shared configuration described in the [root README](../README.md#configuration). Notifications are opt-in. The installed compatibility shim retains any old literal topic assignment but does not send notifications; it is not the new configuration source.
 
 Optional environment overrides:
 
@@ -105,11 +111,11 @@ Optional environment overrides:
 
 `CLAUDE_TASK_LIFECYCLE_OWNER` is internal: the native observer sets it for its own hook processes.
 
-Version **1.0.1** restores assistant-reply notification bodies (the initial integration used boilerplate). Claude temporarily holds the bounded final reply in a mode-0600 `payloads/` outbox while reviews or delivery are pending; it removes that payload after delivery or when new activity invalidates it. Public status, receipts and deduplication records remain metadata-only.
+Claude temporarily holds the bounded final reply in a mode-0600 `payloads/` outbox while reviews or delivery are pending; it removes that payload after delivery or when new activity invalidates it. Public status, receipts and deduplication records remain metadata-only.
 
 ## Operational boundaries
 
-- Native background and cron snapshots require Claude 2.1.145+, while this native mod requires the current mods API (2.1.287+; native tests target 2.1.292). Missing fields remain unknown.
+- This plugin requires Claude 2.1.292+ and its native mods API. Missing background-work fields remain unknown.
 - Editing the source does not update the installed plugin cache. After the approved plugin update, active JavaScript observers require `/reload-plugins` or a new session; already-loaded observers do not pick up an edited file automatically.
 - An indefinitely recurring `/loop` intentionally prevents completion until cancelled and followed by a final parent response.
 - Abrupt process death or a lost review acknowledgement never becomes a synthetic successful completion.
@@ -117,6 +123,6 @@ Version **1.0.1** restores assistant-reply notification bodies (the initial inte
 - The observed task is Claude-managed work plus instrumented rewake producers. Arbitrary detached programs and future unsolicited messages do not have an authoritative inventory in the interactive CLI.
 - HTTP acceptance verifies publication. Delivery to a phone depends on its ntfy subscription. Persistent deduplication prevents routine replays/concurrent duplicates; a crash or timeout around remote acceptance can still make delivery ambiguous.
 - Notification delivery runs outside lifecycle admission. Every HTTP retry rechecks that the question or completion is still current, so answering a question or starting new work can cancel a pending retry.
-- When Claude requires organization settings but cannot load them, authenticate normally. On the tested box, the inherited `CLAUDE_CODE_OAUTH_TOKEN` was stale; `env -u CLAUDE_CODE_OAUTH_TOKEN claude plugin validate .` correctly used the stored OAuth session.
+- When Claude requires organization settings but cannot load them, authenticate normally; a policy failure is not a completed lifecycle test.
 
-For the combined Claude + OpenCode V2 migration bundle and installation/rollback steps, see the Obsidian note **Claude Code and OpenCode V2 - Reliable Herdr and ntfy Notifications**.
+See the [root installation guide](../README.md#install-a-release) for release installation, upgrades and rollback.

@@ -17,6 +17,94 @@ displayed questions, background tasks, and asynchronous review completion.
 Both use Herdr's normal socket API. A completed task is reported as `idle`;
 Herdr decides whether the UI labels that state Idle or Done.
 
+## Install a release
+
+Requirements: **macOS or Linux, Herdr 0.9.3+, Node 22.14+, Python 3.9+**.
+The adapters target **OpenCode 2.0.18** and **Claude Code 2.1.292+**. Download
+the [latest release](https://github.com/balakumardev/herdr-agent-lifecycle/releases/latest)
+into a permanent directory; OpenCode will load the plugin from there.
+
+```sh
+VERSION=$(GH_HOST=github.com gh release view --repo balakumardev/herdr-agent-lifecycle --json tagName --jq .tagName)
+GH_HOST=github.com gh release download "$VERSION" --repo balakumardev/herdr-agent-lifecycle --dir "lifecycle-$VERSION"
+cd "lifecycle-$VERSION"
+shasum -a 256 -c SHA256SUMS
+tar -xzf "herdr-agent-lifecycle-${VERSION#v}.tar.gz"
+cd "herdr-agent-lifecycle-${VERSION#v}"
+npm ci --prefix opencode --ignore-scripts
+npm test
+```
+
+### OpenCode
+
+Preview the registration changes, then apply them:
+
+```sh
+python3 scripts/install-opencode.py --config-dir "${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+python3 scripts/install-opencode.py --config-dir "${XDG_CONFIG_HOME:-$HOME/.config}/opencode" --apply
+```
+
+The installer registers this prepared release in both `opencode.json` and
+`cli.json`, preserves other plugins/options, and disables the two competing
+native Herdr reporters. It migrates a recognized legacy Claude notification
+bridge if present. JSONC with comments or an unfamiliar bridge requires a
+manual merge; the installer refuses it before changing any configuration.
+
+For a manual merge, add these entries to the existing `plugins` arrays:
+
+| File | Entries |
+| --- | --- |
+| `opencode.json(c)` | `"-herdr.opencode.agent-state"`, `"/absolute/release/path/opencode"` |
+| `cli.json` | `"-herdr.opencode.session-selection"`, `"/absolute/release/path/opencode"` |
+
+Watched configuration changes normally hot-reload. Verify the health RPC from
+[OpenCode diagnostics](opencode/README.md#diagnostics); open a fresh TUI for pane
+reporting. The installer never restarts the shared service.
+
+### Claude Code
+
+Preview and apply the hook migration, then run the printed activation commands:
+
+```sh
+python3 claude/install.py
+python3 claude/install.py --apply
+claude plugin marketplace add "$HOME/.claude/local-marketplaces/task-lifecycle"
+claude plugin install task-lifecycle@herdr-agent-lifecycle --scope user
+```
+
+The installer stages an allowlisted local marketplace, replaces the legacy
+notification hook with a passive shim, and wraps enabled user-owned asynchronous
+review hooks. Original conditions, arguments, exit status and rewake behavior
+remain intact. Start a fresh Claude session to load the native observer; run
+`/task-lifecycle-status` to inspect it.
+
+The repository also exposes the public `herdr-agent-lifecycle` marketplace at
+`balakumardev/herdr-agent-lifecycle`. The local-release installation above pins
+the exact verified code and includes review-hook migration.
+
+### Upgrade and rollback
+
+Download a new release into a new directory and rerun its installers. For Claude,
+refresh the staged marketplace and installed cache after staging:
+
+```sh
+claude plugin marketplace update herdr-agent-lifecycle
+claude plugin update task-lifecycle@herdr-agent-lifecycle --scope user
+```
+
+Run the Claude installer again after upgrading another plugin that owns
+`asyncRewake` reviews: upgrades can replace its wrapped hooks. Unrecognized
+review state keeps completion pending until it is instrumented.
+
+Each installer prints its private backup directory. Preview a restoration with
+`python3 scripts/install-opencode.py --restore BACKUP` or
+`python3 claude/install.py --restore BACKUP`; add `--apply` to restore. Later edits
+are refused before any restoration. For hook JSON, Claude backs up only migrated
+records and restores their original structure, preserving configuration secrets
+in their original file. If a later plugin activation or user edit changed a
+backed-up file, merge the recorded hook changes manually rather than replacing
+that file. Stop using the plugin in active clients before removing its files.
+
 ## Configuration
 
 Both adapters read `~/.config/herdr-agent-lifecycle/config.json` (or
