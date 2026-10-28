@@ -1,6 +1,6 @@
 {
   "name": "task-lifecycle",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Child-aware Herdr state and completion/question notifications for Claude Code",
   "author": {
     "name": "balakumardev",

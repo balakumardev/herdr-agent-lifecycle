@@ -1,3 +1,9 @@
+## [1.0.3](https://github.com/balakumardev/herdr-agent-lifecycle/compare/v1.0.2...v1.0.3) (2026-10-28)
+
+### Fixes
+
+* **opencode:** preserve read and unread completion state ([#3](https://github.com/balakumardev/herdr-agent-lifecycle/issues/3)) ([68e3faf](https://github.com/balakumardev/herdr-agent-lifecycle/commit/68e3faf3a15ab3fb3a90cdbc3ffe0545ac98e796))
+
 ## [1.0.2](https://github.com/balakumardev/herdr-agent-lifecycle/compare/v1.0.1...v1.0.2) (2026-10-28)
 
 ### Fixes
