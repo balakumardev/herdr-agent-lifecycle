@@ -182,6 +182,93 @@ test("failed and malformed snapshots preserve the previous report and recover on
   assert.deepEqual(states(reports), [["ses_root", "working"], ["ses_root", "blocked"]]);
 });
 
+test("a failed first snapshot claims unknown state without inventing a root session", async (t) => {
+  const { reports, env } = await socketFixture(t);
+  const ui = host({ resolve: () => Promise.reject(new Error("retired worktree unavailable")) });
+  start(t, ui, env);
+  await until(() => reports.length === 1, "unknown report instead of screen-detected idle");
+  assert.equal(reports[0].params.state, "unknown");
+  assert.equal(reports[0].params.agent, "opencode-v2");
+  assert.equal(reports[0].params.source, "custom:opencode-v2-lifecycle");
+  assert.equal(reports[0].params.agent_session_id, undefined);
+  assert.equal(reports[0].params.resume_argv, undefined);
+  ui.state.resolve = undefined;
+  await until(() => reports.length === 2, "authoritative recovery");
+  assert.deepEqual(states(reports), [[undefined, "unknown"], ["ses_root", "working"]]);
+  assert.deepEqual(reports[1].params.resume_argv, ["opencode", "--session", "ses_root"]);
+});
+
+test("a failed or malformed refresh cannot leave a previously completed pane idle", async (t) => {
+  for (const [name, failure] of [["RPC failure", () => Promise.reject(new Error("server disconnected"))],
+    ["malformed snapshot", () => Promise.resolve({ rootID: "ses_root", state: "idle" })]]) {
+    await t.test(name, async (t) => {
+      const { reports, env } = await socketFixture(t);
+      const ui = host({ response: snapshot({ state: "idle", complete: true, activeCount: 0, reason: "done" }) });
+      start(t, ui, env);
+      await until(() => reports.length === 1, "confirmed completion");
+      ui.state.resolve = failure;
+      ui.emit("session.execution.started", { sessionID: "ses_child" });
+      await until(() => reports.length === 2, "incomplete read retracts idle");
+      assert.deepEqual(states(reports), [["ses_root", "idle"], ["ses_root", "unknown"]]);
+      ui.state.resolve = undefined;
+      ui.state.response = snapshot();
+      await until(() => reports.length === 3, "live descendants recovered");
+      assert.equal(reports[2].params.state, "working");
+    });
+  }
+});
+
+test("lifecycle traffic during failed snapshots cannot suppress Unknown", async (t) => {
+  for (const failure of ["RPC rejection", "malformed response"]) for (const initialIdle of [false, true]) {
+    await t.test(`${failure}: ${initialIdle ? "after confirmed Idle" : "before the first report"}`, async (t) => {
+      const { reports, env } = await socketFixture(t);
+      const ui = host({ options: { refreshIntervalMs: 20 },
+        response: snapshot({ state: "idle", complete: true, activeCount: 0, reason: "done" }) });
+      const fail = () => {
+        ui.emit("session.execution.started", { sessionID: "ses_child" });
+        if (failure === "malformed response") return Promise.resolve({ state: "idle", rootID: "ses_root" });
+        return Promise.reject(new Error("runtime unavailable"));
+      };
+      if (!initialIdle) ui.state.resolve = fail;
+      start(t, ui, env);
+      if (initialIdle) {
+        await until(() => ui.calls.length >= 2, "initial report acknowledged before the outage");
+        ui.state.resolve = fail;
+        ui.emit("session.execution.started", { sessionID: "ses_child" });
+      }
+      await until(() => reports.some(({ params }) => params.state === "unknown"), "Unknown despite an event during every failed read");
+      assert.deepEqual(states(reports), initialIdle ? [["ses_root", "idle"], ["ses_root", "unknown"]] : [[undefined, "unknown"]]);
+      ui.state.resolve = undefined;
+      ui.state.response = snapshot();
+      await until(() => reports.at(-1).params.state === "working", "authoritative recovery");
+    });
+  }
+});
+
+test("an uncertain Idle delivery invalidates older Working confirmation", async (t) => {
+  for (const mode of ["malformed acknowledgement", "acknowledgement raced by new work"]) {
+    await t.test(mode, async (t) => {
+      let ui;
+      const { reports, env } = await socketFixture(t, (request) => {
+        if (request.params.state !== "idle") return;
+        // The receiver has accepted Idle, but the caller cannot rely on its ack.
+        ui.state.resolve = () => Promise.reject(new Error("snapshot unavailable"));
+        if (mode === "malformed acknowledgement") return { id: request.id };
+        ui.emit("session.execution.started", { sessionID: "ses_child" });
+        return { id: request.id, result: { type: "ok" } };
+      });
+      ui = host({ options: { refreshIntervalMs: 20 } });
+      start(t, ui, env);
+      await until(() => ui.calls.length >= 2, "Working acknowledged before the completion attempt");
+      ui.state.response = snapshot({ state: "idle", complete: true, activeCount: 0, reason: "done" });
+      ui.emit("session.execution.succeeded");
+      await until(() => reports.some(({ params }) => params.state === "unknown"), "possibly delivered Idle retracted after snapshot failure");
+      assert.deepEqual(states(reports), [["ses_root", "working"], ["ses_root", "idle"], ["ses_root", "unknown"]]);
+      assert.deepEqual(reports.at(-1).params.resume_argv, ["opencode", "--session", "ses_root"]);
+    });
+  }
+});
+
 test("selection polling and periodic snapshots recover navigation and lost lifecycle events", async (t) => {
   const { reports, env } = await socketFixture(t);
   const ui = host({ options: { refreshIntervalMs: 60 } });
@@ -345,11 +432,13 @@ test("an unresponsive RPC is bounded and retried without accepting its late resp
     return Promise.resolve(snapshot());
   } });
   start(t, ui, env);
-  await until(() => reports.length === 1, "retry after timeout");
+  await until(() => reports.length === 2, "unknown followed by successful retry after timeout");
   assert.equal(ui.calls[0].options.signal.aborted, true);
   pending.resolve(snapshot({ state: "idle", complete: true, reason: "done" }));
   await delay(50);
-  assert.deepEqual(states(reports), [["ses_root", "working"]]);
+  // The timed-out read is now visibly unknown, then recovery is working. The
+  // stale idle response must still produce no report.
+  assert.deepEqual(states(reports), [[undefined, "unknown"], ["ses_root", "working"]]);
 });
 
 test("unhydrated sessions use the TUI location and then the default location", async (t) => {

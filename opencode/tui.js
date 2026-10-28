@@ -125,17 +125,33 @@ export default {
       let acknowledged = false;
       try {
         const snapshot = await requestSnapshot(api, selection, requestMs);
+        if (!validSnapshot(snapshot)) throw new Error("Invalid lifecycle snapshot");
         // Events arriving during a read can invalidate that read. Coalesce one
         // follow-up rather than publishing an obsolete completion or question.
-        if (fresh() && validSnapshot(snapshot)) {
+        if (fresh()) {
+          selection.rootID = snapshot.rootID;
+          // A send can reach Herdr even if its acknowledgement is lost or raced
+          // by new work. The older state no longer proves what the pane shows.
+          selection.confirmed = undefined;
           acknowledged = await reporter.report(snapshot, {
             signal: selection.controller.signal,
             isCurrent: fresh,
           });
+          if (acknowledged && fresh()) selection.confirmed = snapshot;
         }
       } catch {
-        // RPC and socket failures retain the last confirmed pane state. The
-        // short retry uses a fresh authoritative snapshot, never a cached idle.
+        // A missing first report leaves Herdr's screen detector in charge; a
+        // stale idle report also hides new background work. Neither is evidence
+        // of completion. Preserve known working/blocked states, otherwise claim
+        // unknown until the next authoritative read, without inventing ancestry.
+        if (current(selection) && (!selection.confirmed || selection.confirmed.state === "idle")) {
+          await reporter.report({ rootID: selection.rootID, state: "unknown", reason: "snapshot-unavailable" }, {
+            signal: selection.controller.signal,
+            // New work invalidates a successful snapshot, but cannot turn a
+            // failed read into evidence for retaining Idle. Navigation still fences it.
+            isCurrent: () => current(selection),
+          }).catch(() => false);
+        }
       } finally {
         selection.busy = false;
         selection.due = Date.now() + (acknowledged ? refreshMs : retryMs);
