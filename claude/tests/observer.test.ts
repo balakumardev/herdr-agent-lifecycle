@@ -2,12 +2,14 @@ import { expect, mock, test } from 'claude-code/testing';
 
 function setup(on, options = {}) {
   const packets = [];
+  const statuses = [];
   const clock = mock.clock(on, { now: 1000 });
   mock.env(on, {});
   on('env.set', () => ({ value: undefined }));
   on('session.id', () => ({ value: 'session-one' }));
   on('session.start', () => ({ cwd: '/work' }));
   on('command.register', () => ({ value: undefined }));
+  on('ui.status', ($, e) => { statuses.push(e.text); return { value: undefined }; });
   on('settings.read', () => options.settingsFail ? { deny: 'unavailable' } : { value: { hooks: {}, enabledPlugins: {} } });
   on('agent.list', () => options.readAgents ? options.readAgents() : { value: options.agents || [] });
   on('process.run', ($, e) => {
@@ -15,6 +17,9 @@ function setup(on, options = {}) {
     packets.push(packet);
     if (options.configureFails && packet.action === 'configure') {
       return { value: { exitCode: 1, stdout: '{"error":"unavailable"}', stderr: '' } };
+    }
+    if (options.configureReply && packet.action === 'configure') {
+      return { value: { exitCode: 0, stdout: JSON.stringify(options.configureReply(packet)), stderr: '' } };
     }
     return { value: { exitCode: 0, stdout: '{"state":"working"}', stderr: '' } };
   });
@@ -28,7 +33,7 @@ function setup(on, options = {}) {
   on('prompt.submit', ($, e) => ({ text: e.text }));
   on('session.end', () => ({ sessionId: 'session-one' }));
   on('ui.render', () => ({ type: 'engine', ref: 0 }));
-  return { packets, clock };
+  return { packets, clock, statuses };
 }
 
 const START = { cwd: '/work', surface: 'terminal', isInteractive: true };
@@ -214,4 +219,43 @@ test('a failed configuration audit is not healed by the following start receipt'
   await $.turn.complete(COMPLETE);
   await clock.advance(600);
   expect(packets.find(p => p.action === 'complete').has_answer).toBe(false);
+});
+
+test('turns share their module load and a plugin reload starts a new one', async ($, on) => {
+  const { packets } = setup(on);
+  await $.session.start(START);
+  await $.turn.start({ turnId: 'turn-1', text: 'Work' });
+  const [load, turn] = packets.filter(p => p.action === 'configure');
+  expect(load.phase).toBe('load');
+  expect(turn.phase).toBe('turn');
+  expect(typeof load.load_id).toBe('string');
+  expect(turn.load_id).toBe(load.load_id);
+  await $.session.start(START);
+  const reloaded = packets.filter(p => p.action === 'configure').at(-1);
+  expect(reloaded.phase).toBe('load');
+  expect(reloaded.load_id).not.toBe(load.load_id);
+});
+
+test('untracked loaded reviews pin the reload advice until a reload clears it', async ($, on) => {
+  const options = { configureReply: () => ({ configured: true, reload_required: true }) };
+  const { statuses } = setup(on, options);
+  await $.session.start(START);
+  expect(statuses.length).toBe(1);
+  expect(statuses[0]).toContain('/reload-plugins');
+  await $.turn.start({ turnId: 'turn-1', text: 'Work' });
+  expect(statuses.length).toBe(1);
+  options.configureReply = () => ({ configured: true, reload_required: false });
+  await $.session.start(START);
+  expect(statuses.length).toBe(2);
+  expect(statuses[1]).toBe(undefined);
+});
+
+test('a failed configuration keeps the current reload advice', async ($, on) => {
+  const options = { configureReply: () => ({ configured: true, reload_required: true }) };
+  const { statuses } = setup(on, options);
+  await $.session.start(START);
+  options.configureReply = () => ({ error: 'lifecycle_unavailable' });
+  await $.turn.start({ turnId: 'turn-1', text: 'Work' });
+  expect(statuses.length).toBe(1);
+  expect(statuses[0]).toContain('/reload-plugins');
 });

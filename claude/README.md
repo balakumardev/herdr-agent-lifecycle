@@ -28,7 +28,15 @@ Question alerts wait 750 ms and recheck the matching live tool call. Quickly ans
 
 Claude's built-in `sec-default` policy deliberately skips user-tier native `classic.*` handlers. The ordinary command hooks still run, so they capture snapshots; native `turn.complete` supplies the post-turn boundary. Claude's normal synchronous Stop continuation loop finishes before that native boundary.
 
-Native `background_tasks` **does not include `asyncRewake` command hooks**. Those producers require separate acknowledgements. The installer wraps the enabled user-owned producers and the runtime reserves expected reviews before admitting completion. Wrappers that start before the snapshot are reconciled into the same invocation. Plugin upgrades that replace wrappers need a fresh installation/audit.
+Native `background_tasks` **does not include `asyncRewake` command hooks**. Those producers require separate acknowledgements. The installer wraps the enabled user-owned producers and the runtime reserves expected reviews before admitting completion. Wrappers that start before the snapshot are reconciled into the same invocation.
+
+### Plugin updates
+
+Claude installs a plugin update in a new cache directory, without the wrappers, while running sessions keep the hooks they loaded. Each native module load therefore records its plugin hook inventory once, before it re-wraps anything, and audits against that inventory for its lifetime. `/clear` keeps it; `/reload-plugins` starts a new load. Settings hooks are still read live, and a plugin enabled after the load is audited as currently installed.
+
+Once a load has its inventory, at module load and at each turn start, the runtime wraps updated versions of plugins that the installer instrumented before (`plugins/cache/<marketplace>/<plugin>/<version>`), using the installer's own migration and private backups. Existing wrappers are left as they are, and new ones use the interpreter recorded by the explicit installation. A busy installation lock skips one attempt. Other plugins, user settings and staged files are untouched. Earlier manifest records remain for sessions that still run the older version. A session whose loaded hooks were uninstrumented reports `reload_plugins_required` and pins a `/reload-plugins` status line; the reload registers the wrapped version. A review that already ran untracked before the reload stays untracked: if it later returns feedback, Claude starts a new turn. `claude.reinstrumentPluginUpdates: false` disables this step, leaving `untracked_async_hook` until a manual `install.py --reinstrument --apply` or a full installer run.
+
+One narrow window remains. If another session wraps a plugin between Claude reading its hooks and this load recording its inventory, the session waits on a review that never starts (`background_review`); start a new session. Each automatic run keeps its own private backup, so restore backups newest first; `install.py --restore` names a later backup that has to be restored first.
 
 ### Reusable named teammates: strict by default
 
@@ -92,13 +100,13 @@ In a fresh Claude session:
 /task-lifecycle-status
 ```
 
-It prints the observed state/reason, pending-review count, and observer health. Inspect the calling pane with:
+It prints the observed state/reason, pending-review count, and observer health. `reload_plugins_required` means this session loaded review hooks that an update left uninstrumented; run `/reload-plugins`. `untracked_async_hook` means an asynchronous review is not instrumented: a plugin or settings hook the installer has not wrapped, or settings that could not be read. Inspect the calling pane with:
 
 ```sh
 herdr agent explain "$HERDR_PANE_ID" --json
 ```
 
-The authority is `custom:claude-task-lifecycle`. Receipts live under `$XDG_STATE_HOME/claude/task-lifecycle/receipts.jsonl`, defaulting to `~/.local/state/claude/task-lifecycle/receipts.jsonl`. Receipt fields contain a hashed key, event kind, timestamp, numeric HTTP status, attempt count, retry deadline, terminal flag, and delivery outcome. Prompt text, questions, commands, response bodies, URLs, and the private ntfy topic are excluded. `deliveries/` holds the per-notice delivery/backoff records; `endpoints/` holds hashed endpoint cooldowns. `delivery-queue-v2.json` contains pending session/owner/generation/admission identifiers, destination hashes and retry times only. Its versioned filename keeps older unscoped workers from consuming newly admitted jobs.
+The authority is `custom:claude-task-lifecycle`. Receipts live under `$XDG_STATE_HOME/claude/task-lifecycle/receipts.jsonl`, defaulting to `~/.local/state/claude/task-lifecycle/receipts.jsonl`. Receipt fields contain a hashed key, event kind, timestamp, numeric HTTP status, attempt count, retry deadline, terminal flag, and delivery outcome. Prompt text, questions, commands, response bodies, URLs, and the private ntfy topic are excluded. `deliveries/` holds the per-notice delivery/backoff records; `endpoints/` holds hashed endpoint cooldowns. `delivery-queue-v2.json` contains pending session/owner/generation/admission identifiers, destination hashes and retry times only. Its versioned filename keeps older unscoped workers from consuming newly admitted jobs. `loads/` holds each module load's plugin hook inventory: wrapper IDs, enabled plugin names, matchers and `if` conditions, removed after 30 days without use.
 
 Both integrations read the shared configuration described in the [root README](../README.md#configuration). Notifications are opt-in. The installed compatibility shim retains any old literal topic assignment but does not send notifications; it is not the new configuration source.
 

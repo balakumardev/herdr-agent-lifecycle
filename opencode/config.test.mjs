@@ -17,6 +17,7 @@ function fixture(t, value) {
 test('an unconfigured install is strict and cannot publish notifications', async (t) => {
   const config = loadConfig(fixture(t));
   assert.equal(config.claude.allowIdleTeammates, false);
+  assert.equal(config.claude.reinstrumentPluginUpdates, true);
   assert.equal(config.opencode.command, 'opencode');
   let requests = 0;
   const notifier = createNotifier({ config, fetchImpl: async () => { requests++; return new Response(null); } });
@@ -26,10 +27,12 @@ test('an unconfigured install is strict and cannot publish notifications', async
 
 test('explicit public configuration supplies the endpoint, topic and launch command', async (t) => {
   const f = fixture(t, { notifications: { enabled: true, topic: 'fixture-topic', endpoint: 'https://notify.example.test/base' },
-    opencode: { command: '/Applications/OpenCode CLI/opencode' }, claude: { allowIdleTeammates: true } });
+    opencode: { command: '/Applications/OpenCode CLI/opencode' },
+    claude: { allowIdleTeammates: true, reinstrumentPluginUpdates: false } });
   const config = loadConfig(f);
   assert.equal(config.opencode.command, '/Applications/OpenCode CLI/opencode');
   assert.equal(config.claude.allowIdleTeammates, true);
+  assert.equal(config.claude.reinstrumentPluginUpdates, false);
   const requests = [];
   const notifier = createNotifier({ config, stateDirectory: join(f.home, 'state'), fetchImpl: async (url, init) => {
     requests.push([String(url), init.body]); return new Response(null, { status: 200 });
@@ -47,6 +50,7 @@ test('XDG configuration is honored without requiring a Claude dotfile', (t) => {
 });
 
 for (const invalid of ['{not-json', [], { claude: { allowIdleTeammates: 'true' } },
+  { claude: { reinstrumentPluginUpdates: 'false' } },
   { notifications: { enabled: 'false' } }, { notifications: { enabled: true } },
   { notifications: { enabled: true, topic: '../private' } },
   { notifications: { endpoint: 'https://user:PRIVATE@notify.example.test' } },

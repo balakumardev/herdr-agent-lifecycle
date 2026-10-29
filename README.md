@@ -94,9 +94,15 @@ claude plugin marketplace update herdr-agent-lifecycle
 claude plugin update task-lifecycle@herdr-agent-lifecycle --scope user
 ```
 
-Run the Claude installer again after upgrading another plugin that owns
-`asyncRewake` reviews: upgrades can replace its wrapped hooks. Unrecognized
-review state keeps completion pending until it is instrumented.
+Sessions that were already open keep the previous observer, which audits review
+hooks as currently installed. Run `/reload-plugins` in each before its next
+prompt, or start a new session. A session that runs a turn first may report
+`unsettled_previous_run` after the reload; `/clear` it.
+
+Updates of another plugin that owns `asyncRewake` reviews are re-instrumented
+automatically; see [Claude plugin updates](#claude-plugin-updates). Run the
+Claude installer again after installing a *new* plugin that owns such reviews.
+Unrecognized review state keeps completion pending until it is instrumented.
 
 Each installer prints its private backup directory. Preview a restoration with
 `python3 scripts/install-opencode.py --restore BACKUP` or
@@ -117,7 +123,7 @@ Both adapters read `~/.config/herdr-agent-lifecycle/config.json` (or
 {
   "notifications": { "enabled": false, "endpoint": "https://ntfy.sh", "topic": "" },
   "opencode": { "command": "opencode" },
-  "claude": { "allowIdleTeammates": false }
+  "claude": { "allowIdleTeammates": false, "reinstrumentPluginUpdates": true }
 }
 ```
 
@@ -143,6 +149,37 @@ Set `claude.allowIdleTeammates` to the boolean `true` to opt into the previous
 best-effort idle-roster fallback. This can report Done prematurely. Strings such
 as `"true"` are rejected. Use `/task-lifecycle-status` to inspect the current
 reason. Review, continuation, question, and permission gates apply in both modes.
+
+### Claude plugin updates
+
+Claude installs each plugin version in a new cache directory. An update of a
+plugin whose reviews the installer wrapped, such as `security-guidance`, arrives
+with plain `asyncRewake` hooks. Their completion cannot be observed, so the
+task would stay Working.
+
+```text
+installer wraps 2.0.16 reviews ──> Claude auto-updates to 2.0.17 (unwrapped)
+                                              │
+              next session start or turn re-wraps 2.0.17, as the installer would
+                                              │
+        later sessions: tracked reviews ──> Done after they settle
+```
+
+- A running session keeps the hooks it loaded. Its completion follows those
+  hooks, not the newly installed version.
+- Only plugins whose earlier versions the installer instrumented are re-wrapped,
+  with the same private backups. Existing wrappers are left as they are, and new
+  ones use the interpreter the installation recorded. A newly installed plugin
+  still needs the installer. Run `python3 claude/install.py --reinstrument` to
+  preview this step, or add `--apply` to run it yourself.
+- Restore backups newest first. `--restore` names a later automatic backup that
+  has to be restored before an earlier one.
+- A session that loaded the unwrapped version stays Working with reason
+  `reload_plugins_required`, and a status line asks you to run
+  `/reload-plugins`. The reload registers the instrumented hooks.
+
+Set `claude.reinstrumentPluginUpdates` to the boolean `false` to turn this off.
+Updated reviews then stay `untracked_async_hook` until you rerun the installer.
 
 ## Development
 

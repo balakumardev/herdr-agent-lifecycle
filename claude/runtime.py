@@ -18,6 +18,10 @@ from transport import Transport, bounded_message, locked, save_json
 from bash_conditions import match_bash_condition
 
 
+AUDITED_EVENTS = ("Stop", "SubagentStop", "PostToolUse", "UserPromptSubmit")
+LOAD_RETENTION_SECONDS = 30 * 86400
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
@@ -73,7 +77,8 @@ def classify(state):
            for item in state["reviews"].values()):
         return "blocked", "unsettled_previous_run"
     if state.get("unknown_hook"):
-        return "working", "untracked_async_hook"
+        # The loaded hooks are uninstrumented, but their installed versions are not.
+        return "working", "reload_plugins_required" if state.get("reload_required") else "untracked_async_hook"
     if any(state.get("unknown_dispatches", {}).values()):
         return "working", "review_applicability_unknown"
     if any(item["status"] in ("expected", "running") for item in state["reviews"].values()):
@@ -209,13 +214,56 @@ def audit_hooks(event, config_dir=None):
 
 class Runtime:
     def __init__(self, state_dir, transport, *, env=None, hook_audit=audit_hooks, background_delivery=False,
-                 allow_idle_teammates=False):
+                 allow_idle_teammates=False, reinstrument=None):
         self.root = Path(state_dir)
         self.transport = transport
         self.env = dict(os.environ if env is None else env)
         self.hook_audit = hook_audit
         self.background_delivery = background_delivery
         self.allow_idle_teammates = allow_idle_teammates is True
+        self.reinstrument = reinstrument
+
+    def _loaded_plugins(self, load_id, enabled, records, settings_available):
+        """Plugin hooks as registered for this native module load.
+
+        Claude keeps a session's plugin hooks until /reload-plugins, even after a
+        background update installs another version; /clear keeps them too. This
+        load re-wraps nothing before its snapshot exists.
+        """
+        if not isinstance(load_id, str) or not load_id or len(load_id) > 256:
+            return None
+        path = self.root / "loads" / (digest(load_id) + ".json")
+        snapshot = load_json(path, None)
+        if isinstance(snapshot, dict) and snapshot.get("schema") == 1:
+            try:
+                os.utime(path)
+            except OSError:
+                pass
+            return snapshot
+        if not settings_available or not isinstance(enabled, dict):
+            return None  # The loaded plugin set is unknown: keep auditing live.
+        names = sorted(name for name, flag in enabled.items() if flag)
+        events = {}
+        for name in AUDITED_EVENTS:
+            expected, unknown = self.hook_audit({"hook_event_name": name, "effective_hooks": [],
+                                                 "enabled_plugins": {plugin: True for plugin in names}})
+            events[name] = {"expected": expected, "unknown": unknown}
+        identifiers = {identifier for item in events.values() for identifier in item["expected"]}
+        known = {record["id"]: record for record in records
+                 if isinstance(record, dict) and record.get("id") in identifiers}
+        # Keep the loaded matchers and conditions: a later installer run drops old records.
+        snapshot = {"schema": 1, "enabled": names, "events": events,
+                    "matchers": {key: record.get("matcher") or "" for key, record in known.items()},
+                    "conditions": {key: (record.get("original") or {}).get("if") for key, record in known.items()}}
+        save_json(path, snapshot)
+        cutoff = time.time() - LOAD_RETENTION_SECONDS
+        for old in path.parent.glob("*.json"):
+            try:
+                if old.stat().st_mtime < cutoff:
+                    old.unlink()
+            except OSError:
+                pass
+        return snapshot
 
     def path(self, session_id):
         return self.root / "sessions" / (digest(session_id) + ".json")
@@ -498,9 +546,11 @@ class Runtime:
             name = event.get("hook_event_name")
             if name in ("Stop", "SubagentStop", "PostToolUse", "UserPromptSubmit"):
                 inventory = state.get("hook_inventory", {}).get(name)
+                conditions = {}
                 if inventory is not None and self.hook_audit is audit_hooks:
                     expected = inventory["expected"]
                     unknown = inventory["unknown"]
+                    conditions = inventory.get("conditions", {})
                     match_field = "agent_type" if name == "SubagentStop" else "tool_name" if name == "PostToolUse" else None
                     if match_field:
                         matches = []
@@ -520,7 +570,10 @@ class Runtime:
                 by_id = {record["id"]: record for record in records}
                 applicable, uncertain = [], []
                 for identifier in expected:
-                    condition = by_id.get(identifier, {}).get("original", {}).get("if")
+                    if identifier in conditions:
+                        condition = conditions[identifier]
+                    else:
+                        condition = by_id.get(identifier, {}).get("original", {}).get("if")
                     answer = condition_matches(condition, event)
                     if answer is True:
                         applicable.append(identifier)
@@ -567,7 +620,9 @@ class Runtime:
                         save_json(pane_path, {"owner": event["owner"], "session_id": session_id,
                                               "born_at": born, "report_seq": pane.get("report_seq", 0)})
                 state.update(owner=event["owner"], born_at=born, seq=event["seq"],
-                             running=False, closed=False, failure=None, questions=[], permissions=[], children=[])
+                             running=False, closed=False, failure=None, questions=[], permissions=[], children=[],
+                             # A new module load registers its own hooks; its configure re-audits them.
+                             unknown_hook=False, reload_required=False)
                 self._invalidate(state)
                 state["herdr"] = herdr
                 save_json(self.path(session_id), state)
@@ -582,15 +637,43 @@ class Runtime:
                 inventory = {}
                 config_dir = Path(self.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
                 wrappers = load_json(config_dir / "hooks/task-lifecycle/install-manifest.json", {}).get("wrappers", [])
-                for name in ("Stop", "SubagentStop", "PostToolUse", "UserPromptSubmit"):
+                hooks = event.get("hooks", {})
+                enabled = event.get("enabled_plugins", {})
+                loaded = self._loaded_plugins(event.get("load_id"), enabled, wrappers,
+                                              isinstance(hooks.get("Stop"), list))
+                matchers = {record["id"]: record.get("matcher", "") for record in wrappers}
+                conditions = {}
+                live_plugins = enabled
+                if loaded is not None:
+                    matchers.update(loaded["matchers"])
+                    conditions = loaded["conditions"]
+                    # A plugin enabled after this load is audited as installed now.
+                    live_plugins = ({plugin: flag for plugin, flag in enabled.items()
+                                     if flag and plugin not in loaded["enabled"]} if isinstance(enabled, dict) else {})
+                for name in AUDITED_EVENTS:
+                    # Settings hooks are always read live from the native merged settings.
                     expected, unknown = self.hook_audit({
-                        "hook_event_name": name, "effective_hooks": event.get("hooks", {}).get(name, []),
-                        "enabled_plugins": event.get("enabled_plugins", {})})
+                        "hook_event_name": name, "effective_hooks": hooks.get(name, []),
+                        "enabled_plugins": live_plugins})
+                    if loaded is not None:
+                        expected = list(dict.fromkeys(loaded["events"][name]["expected"] + expected))
+                        unknown = unknown or loaded["events"][name]["unknown"]
                     inventory[name] = {"expected": expected, "unknown": unknown,
-                                       "matchers": {record["id"]: record.get("matcher", "") for record in wrappers}}
+                                       "matchers": matchers, "conditions": conditions}
                 state["hook_inventory"] = inventory
+                # Never before this load has its own snapshot; later loads register the re-wrapped files.
+                if loaded is not None and event.get("phase") in ("load", "turn") and self.reinstrument is not None:
+                    self.reinstrument()
+                reload_required = False
+                if loaded is not None and any(loaded["events"][name]["unknown"] for name in AUDITED_EVENTS):
+                    # /reload-plugins registers the currently installed versions instead.
+                    current = {plugin: True for plugin in loaded["enabled"]}
+                    reload_required = not any(
+                        self.hook_audit({"hook_event_name": name, "effective_hooks": [], "enabled_plugins": current})[1]
+                        for name in AUDITED_EVENTS if loaded["events"][name]["unknown"])
+                state["reload_required"] = reload_required
                 save_json(self.path(session_id), state)
-                return {"configured": True}
+                return {"configured": True, "reload_required": reload_required}
             elif action in ("start", "activity", "child_start", "child_complete"):
                 self._invalidate(state)
                 state["closed"] = False
@@ -719,6 +802,30 @@ class Runtime:
             return self._emit(state)
 
 
+def reinstrument_plugins(config_dir=None):
+    """Re-wrap updated versions of already instrumented plugins; never blocks a turn.
+
+    A concurrent installer or session holding the installation lock wins; the
+    next turn retries. Returns whether any file changed.
+    """
+    config_dir = Path(config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    if config_dir.name != ".claude":
+        return False  # The installer only manages <home>/.claude.
+    try:
+        import install
+        installation = install.Installation(config_dir.parent, Path(__file__).resolve().parent)
+        if not (installation.target / "install-manifest.json").is_file():
+            return False
+        with locked(installation.target / ".install.lock", timeout=0):
+            installation.plan_reinstrument()
+            installation.apply()
+        return bool(installation.changes)
+    except Exception:
+        # Maintenance only: a failure leaves the update untracked, which already
+        # keeps completion pending. It must not make the lifecycle unavailable.
+        return False
+
+
 def default_runtime():
     from configuration import load_config
     config = load_config()
@@ -730,7 +837,8 @@ def default_runtime():
     topic = notification["topic"] if notification["enabled"] else None
     endpoint = os.environ.get("CLAUDE_TASK_LIFECYCLE_ENDPOINT", notification["endpoint"])
     return Runtime(root, Transport(root, topic_file, endpoint=endpoint, topic=topic), background_delivery=True,
-                   allow_idle_teammates=config["claude"]["allowIdleTeammates"])
+                   allow_idle_teammates=config["claude"]["allowIdleTeammates"],
+                   reinstrument=reinstrument_plugins if config["claude"]["reinstrumentPluginUpdates"] else None)
 
 
 def begin_hook(hook_input, hook_id):

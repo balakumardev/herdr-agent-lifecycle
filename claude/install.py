@@ -165,16 +165,26 @@ def legacy_registration(hook, event, home):
     return False
 
 
-def original_hook(hook, runner):
-    """Recover our own invocation on reapply, including after a property edit."""
-    original = copy.deepcopy(hook)
+def invocation(hook):
+    """The argument vector of a command hook; a shell command is split as a shell would."""
     try:
-        args = ([hook["command"], *hook["args"]] if "args" in hook
+        return ([hook["command"], *hook["args"]] if "args" in hook
                 else shlex.split(hook.get("command", "")))
     except (ValueError, TypeError, KeyError):
         raise InstallError("invalid asyncRewake command or arguments") from None
+
+
+def original_hook(hook, runner):
+    """Recover our own invocation on reapply, including after a property edit.
+
+    Also returns the lifecycle id of an existing wrapper, whatever interpreter it names.
+    """
+    original = copy.deepcopy(hook)
+    args = invocation(hook)
+    wrapper = None
     if (len(args) >= 6 and args[1:3] == [str(runner), "--id"]
             and isinstance(args[3], str) and re.fullmatch(r"async-[0-9a-f]{24}", args[3])):
+        wrapper = args[3]
         if args[4] == "--shell" and len(args) == 6:
             original["command"] = args[5]
             original.pop("args", None)
@@ -188,17 +198,17 @@ def original_hook(hook, runner):
     if "args" in original and (not isinstance(original["args"], list)
                                or any(not isinstance(a, str) for a in original["args"])):
         raise InstallError("asyncRewake exec arguments must be a string array")
-    return original
+    return original, wrapper
 
 
-def wrap_hook(original, hook_id, runner):
+def wrap_hook(original, hook_id, runner, python=None):
     hook = copy.deepcopy(original)
-    invocation = [str(Path(sys.executable).resolve()), str(runner), "--id", hook_id]
+    runner_args = [str(python or Path(sys.executable).resolve()), str(runner), "--id", hook_id]
     if "args" in original:
-        hook["command"] = invocation[0]
-        hook["args"] = invocation[1:] + ["--", original["command"], *original["args"]]
+        hook["command"] = runner_args[0]
+        hook["args"] = runner_args[1:] + ["--", original["command"], *original["args"]]
     else:
-        hook["command"] = shlex.join(invocation + ["--shell", original["command"]])
+        hook["command"] = shlex.join(runner_args + ["--shell", original["command"]])
     return hook
 
 
@@ -227,7 +237,20 @@ def public_artifacts(source):
                 yield str(path.relative_to(source))
 
 
-def plugin_files(settings, claude):
+def cache_identity(path, claude):
+    """Claude installs every version under plugins/cache/<marketplace>/<plugin>/<version>.
+
+    The first two parts name the plugin across versions. Other layouts get None,
+    so no version-independent identity is guessed for them.
+    """
+    try:
+        parts = Path(path).resolve().relative_to((claude / "plugins/cache").resolve()).parts
+    except (ValueError, OSError):
+        return None
+    return parts[:2] if len(parts) >= 3 else None
+
+
+def plugin_files(settings, claude, select=None):
     enabled = settings.get("enabledPlugins", {})
     if not isinstance(enabled, dict):
         raise InstallError("invalid enabledPlugins configuration")
@@ -252,6 +275,8 @@ def plugin_files(settings, claude):
             # Managed policy and project locations cannot be brought into scope by a registry entry.
             root = Path(install_path)
             if not root.is_absolute() or not root.resolve().is_relative_to(claude.resolve()):
+                continue
+            if select is not None and not select(root):
                 continue
             default = root / "hooks/hooks.json"
             paths = [default] if default.is_file() else []
@@ -299,6 +324,9 @@ class Installation:
         self.removed = 0
         self.native_rewake = {}
         self.backup = None
+        # Reinstrumentation keeps existing wrappers and reuses the installation's interpreter.
+        self.keep_wrappers = False
+        self.python = None
 
     def change(self, path, data, mode=None, patches=None):
         confined(path, self.claude)
@@ -337,7 +365,7 @@ class Installation:
                             after = None
                             self.removed += 1
                         elif event in EVENTS and hook.get("type") == "command":
-                            original = original_hook(hook, self.target / "hook_runner.py")
+                            original, wrapper = original_hook(hook, self.target / "hook_runner.py")
                             key = native_hook_identity(original, event, plugin_root)
                             rewake = original.get("asyncRewake") is True
                             if key in self.native_rewake and self.native_rewake[key] != rewake:
@@ -345,7 +373,8 @@ class Installation:
                             self.native_rewake[key] = rewake
                             if rewake:
                                 hook_id = "async-" + hashlib.sha256(key).hexdigest()[:24]
-                                after = wrap_hook(original, hook_id, self.target / "hook_runner.py")
+                                after = (hook if self.keep_wrappers and wrapper == hook_id
+                                         else wrap_hook(original, hook_id, self.target / "hook_runner.py", self.python))
                                 self.wrappers.append({"id": hook_id, "event": event, "matcher": group.get("matcher"),
                                                       "file": str(path), "original": original, "wrapped": after})
                                 self.wrapped += after != hook
@@ -404,6 +433,46 @@ class Installation:
                     "wrappers": sorted(self.wrappers, key=lambda record: record["id"])}
         self.change(self.target / "install-manifest.json", json_bytes(manifest), 0o600)
 
+    def plan_reinstrument(self):
+        """Wrap plugin versions that Claude installed after an explicit installation.
+
+        A plugin update gets a new cache directory without the wrappers, so its
+        background reviews become untracked. Only plugins whose earlier versions
+        this installation instrumented are migrated, as the installer would, but
+        existing wrappers stay untouched and new ones use the interpreter the
+        installation chose, not the one running this observer. Nothing is staged
+        and user settings are left alone. Existing records remain: running
+        sessions keep the hooks they loaded.
+        """
+        manifest_path = confined(self.target / "install-manifest.json", self.claude)
+        manifest = read_json(manifest_path)
+        records = manifest.get("wrappers")
+        if manifest.get("version") != 1 or not isinstance(records, list):
+            return
+        located = [record for record in records if isinstance(record, dict) and isinstance(record.get("file"), str)]
+        approved = {cache_identity(record["file"], self.claude) for record in located} - {None}
+        if not approved:
+            return
+        interpreters = {}
+        for record in located:
+            try:
+                args = invocation(record["wrapped"]) if isinstance(record.get("wrapped"), dict) else []
+            except InstallError:
+                continue
+            if args[1:3] == [str(self.target / "hook_runner.py"), "--id"] and Path(args[0]).is_file():
+                interpreters[cache_identity(record["file"], self.claude)] = args[0]
+        self.keep_wrappers = True
+        settings = read_json(confined(self.claude / "settings.json", self.claude))
+        selected = lambda root: cache_identity(root, self.claude) in approved
+        for plugin_root, path, definitions in plugin_files(settings, self.claude, select=selected):
+            self.python = interpreters.get(cache_identity(plugin_root, self.claude))
+            self.migrate_hooks(path, plugin_root, definitions=definitions)
+        # Merged even without file changes, so a run interrupted before this write heals.
+        current = {record["id"]: record for record in records if isinstance(record, dict) and "id" in record}
+        current.update((record["id"], record) for record in self.wrappers)
+        self.change(manifest_path, json_bytes({**manifest, "wrappers": sorted(current.values(),
+                                                                             key=lambda record: record["id"])}), 0o600)
+
     def apply(self):
         if not self.changes:
             return
@@ -450,7 +519,9 @@ class Installation:
                     continue
             if (digest(current) != record["after_hash"]
                     or stat.S_IMODE(path.stat().st_mode) != record["installed_mode"]):
-                raise InstallError("a file changed after installation; no files restored")
+                later = self.later_backup(path, digest(current), backup)
+                raise InstallError("a file changed after installation; no files restored"
+                                   + ("; restore the later backup " + str(later) + " first" if later else ""))
             if "changes" in record:
                 original = json_bytes(restore_hooks(json.loads(current), record["changes"]))
                 if digest(original) != record["before_json_hash"]:
@@ -471,39 +542,64 @@ class Installation:
                 else:
                     atomic_write(change["path"], change["data"], change["mode"])
 
-    def report(self, applied):
+    def later_backup(self, path, current, restoring):
+        """The backup whose run produced this file, e.g. an automatic reinstrumentation."""
+        for metadata in sorted((self.target / "backups").glob("*/backup.json")):
+            if metadata.parent.resolve() == restoring:
+                continue
+            try:
+                files = read_json(metadata).get("files")
+            except (InstallError, OSError):
+                continue
+            if isinstance(files, list) and any(
+                    isinstance(record, dict) and record.get("file") == str(path) and record.get("after_hash") == current
+                    for record in files):
+                return metadata.parent
+        return None
+
+    def report(self, applied, commands=True):
         return {"mode": "apply" if applied else "dry-run", "changed_files": len(self.changes),
                 "wrapped_hooks": self.wrapped, "tracked_hooks": len(self.wrappers),
                  "removed_hooks": self.removed, "minimum_claude_version": MINIMUM_CLAUDE_VERSION,
                  "backup_directory": str(self.backup) if self.backup else None,
                  "commands": ["claude plugin marketplace add " + shlex.quote(str(self.market)),
-                              "claude plugin install task-lifecycle@" + MARKETPLACE + " --scope user"]}
+                              "claude plugin install task-lifecycle@" + MARKETPLACE + " --scope user"] if commands else []}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path.home())
     parser.add_argument("--source-dir", type=Path, default=Path(__file__).resolve().parent)
-    parser.add_argument("--restore", type=Path, help="Reverse a backup, refusing later edits; defaults to dry-run")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--restore", type=Path, help="Reverse a backup, refusing later edits; defaults to dry-run")
+    action.add_argument("--reinstrument", action="store_true",
+                        help="Only re-wrap updated versions of already instrumented plugins; defaults to dry-run")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     try:
         installation = Installation(args.home, args.source_dir)
-        if args.apply:
+        if args.reinstrument and not (installation.target / "install-manifest.json").is_file():
+            pass  # Nothing was instrumented here; do not create installation state either.
+        elif args.apply:
             with locked(installation.target / ".install.lock"):
                 if args.restore:
                     installation.restore(args.restore, apply=True)
+                elif args.reinstrument:
+                    installation.plan_reinstrument()
+                    installation.apply()
                 else:
                     installation.plan()
                     installation.apply()
         else:
             if args.restore:
                 installation.restore(args.restore)
+            elif args.reinstrument:
+                installation.plan_reinstrument()
             else:
                 installation.plan()
-        print(json.dumps(installation.report(args.apply)))
+        print(json.dumps(installation.report(args.apply, commands=not args.reinstrument)))
         return 0
     except InstallError as error:
         print(json.dumps({"error": str(error)}))

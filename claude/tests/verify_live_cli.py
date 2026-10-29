@@ -162,7 +162,8 @@ def main():
                 configuration.write_text(json.dumps({
                     'notifications': {'enabled': True, 'topic': 'local-test-only',
                                       'endpoint': 'http://127.0.0.1:' + str(server.server_port)},
-                    'claude': {'allowIdleTeammates': mode == 'named-teammate'},
+                    # The fixture must never re-wrap plugins in the developer's real configuration.
+                    'claude': {'allowIdleTeammates': mode == 'named-teammate', 'reinstrumentPluginUpdates': False},
                 }))
                 session_id = str(uuid.uuid4())
                 team = 'session-' + session_id[:8]

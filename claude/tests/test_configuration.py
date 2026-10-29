@@ -26,8 +26,12 @@ class ConfigurationTests(unittest.TestCase):
     def test_unconfigured_install_is_strict_and_notifications_are_disabled(self):
         config = self.config()
         self.assertIs(config["claude"]["allowIdleTeammates"], False)
+        self.assertIs(config["claude"]["reinstrumentPluginUpdates"], True)
         self.assertIs(config["notifications"]["enabled"], False)
         self.assertEqual(config["opencode"]["command"], "opencode")
+
+    def test_plugin_update_reinstrumentation_can_be_disabled(self):
+        self.assertIs(self.config({"claude": {"reinstrumentPluginUpdates": False}})["claude"]["reinstrumentPluginUpdates"], False)
 
     def test_direct_topic_reaches_the_real_transport_admission(self):
         config = self.config({"notifications": {"enabled": True, "topic": "fixture-topic", "endpoint": "https://notify.example.test/base"},
@@ -45,7 +49,8 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(load_config(home=self.home, env={"XDG_CONFIG_HOME": str(directory.parent)})["opencode"]["command"], "opencode2")
 
     def test_invalid_values_do_not_enable_notifications_or_fallback(self):
-        for value in ([], {"claude": {"allowIdleTeammates": "true"}}, {"notifications": {"enabled": "false"}},
+        for value in ([], {"claude": {"allowIdleTeammates": "true"}}, {"claude": {"reinstrumentPluginUpdates": "false"}},
+                      {"notifications": {"enabled": "false"}},
                       {"notifications": {"enabled": True}}, {"notifications": {"enabled": True, "topic": "../private"}},
                       {"notifications": {"endpoint": "https://user:PRIVATE@notify.example.test"}},
                       {"notifications": {"endpoint": "file:///private"}}, {"opencode": {"command": ""}}):

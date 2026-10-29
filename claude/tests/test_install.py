@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -378,6 +379,130 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(old_plugin.isdisjoint(new_plugin), "a new plugin root is a new native scope")
         self.assertFalse(any(r["file"] == str(self.plugin_path) for r in current))
         self.assertEqual(self.plugin_path.read_bytes(), old_content)
+
+    def install_cached_plugin(self, version, enable=False):
+        """Claude's own layout: plugins/cache/<marketplace>/<plugin>/<version>."""
+        root = self.claude / "plugins/cache/market/guard" / version
+        write_json(root / ".claude-plugin/plugin.json", {"name": "guard", "version": version})
+        write_json(root / "hooks/hooks.json", self.plugin_config)
+        registry = json.loads(self.registry_path.read_text())
+        registry["plugins"]["guard@market"] = [{"scope": "user", "installPath": str(root), "version": version}]
+        write_json(self.registry_path, registry)
+        if enable:
+            self.settings["enabledPlugins"]["guard@market"] = True
+            write_json(self.settings_path, self.settings)
+        return root
+
+    def test_reinstrument_wraps_the_updated_version_of_an_instrumented_plugin(self):
+        self.install_cached_plugin("1.0.0", enable=True)
+        self.run_installer("--apply")
+        installed = {r["id"] for r in self.manifest()["wrappers"]}
+        updated = self.install_cached_plugin("1.1.0")
+        untouched = {p: p.read_bytes() for p in (self.settings_path, self.plugin_path, self.registry_path,
+                                                self.shim, self.target / "runtime.py")}
+        staged = snapshot(self.market)
+        self.assertEqual(self.run_installer("--reinstrument")["wrapped_hooks"], 4)
+        self.assertEqual(json.loads((updated / "hooks/hooks.json").read_text()), self.plugin_config)
+        report = self.run_installer("--reinstrument", "--apply")
+        self.assertEqual(report["wrapped_hooks"], 4)
+        self.assertIsInstance(report["backup_directory"], str)
+        self.assertEqual(report["commands"], [], "reinstrumentation activates nothing")
+        for path, content in untouched.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(snapshot(self.market), staged)
+        current = self.manifest()["wrappers"]
+        new = [r for r in current if r["file"] == str(updated / "hooks/hooks.json")]
+        self.assertEqual(len(new), 4)
+        self.assertTrue(installed <= {r["id"] for r in current}, "already-loaded sessions lost their records")
+        stored = json.loads((updated / "hooks/hooks.json").read_text())
+        for record in new:
+            hooks = [hook for group in stored["hooks"][record["event"]]
+                     if group.get("matcher") == record["matcher"] for hook in group["hooks"]]
+            self.assertIn(record["wrapped"], hooks)
+        self.assertEqual(stored["hooks"]["Notification"], self.plugin_config["hooks"]["Notification"])
+        self.assertEqual(self.run_installer("--reinstrument", "--apply")["changed_files"], 0)
+
+    def test_reinstrument_leaves_plugins_the_installer_never_instrumented(self):
+        self.run_installer("--apply")
+        later = self.install_cached_plugin("1.0.0", enable=True)
+        before = (later / "hooks/hooks.json").read_bytes()
+        report = self.run_installer("--reinstrument", "--apply")
+        self.assertEqual(report["changed_files"], 0)
+        self.assertIsNone(report["backup_directory"])
+        self.assertEqual((later / "hooks/hooks.json").read_bytes(), before)
+
+    def test_reinstrument_backup_restores_the_updated_plugin_and_manifest(self):
+        self.install_cached_plugin("1.0.0", enable=True)
+        self.run_installer("--apply")
+        manifest = (self.target / "install-manifest.json").read_bytes()
+        updated = self.install_cached_plugin("1.1.0")
+        report = self.run_installer("--reinstrument", "--apply")
+        self.run_installer("--restore", report["backup_directory"], "--apply")
+        self.assertEqual(json.loads((updated / "hooks/hooks.json").read_text()), self.plugin_config)
+        self.assertEqual((self.target / "install-manifest.json").read_bytes(), manifest)
+
+    def reinstrument_in_process(self, python):
+        """Reinstrumentation as run by an observer whose `python3` resolves elsewhere."""
+        sys.path.insert(0, str(ROOT))
+        self.addCleanup(sys.path.remove, str(ROOT))
+        import install
+        with mock.patch.object(sys, "executable", str(python)):
+            installation = install.Installation(self.home, self.source)
+            installation.plan_reinstrument()
+            installation.apply()
+        return installation
+
+    def test_reinstrument_keeps_wrappers_whatever_interpreter_runs_the_observer(self):
+        self.install_cached_plugin("1.0.0", enable=True)
+        self.run_installer("--apply")
+        updated = self.install_cached_plugin("1.1.0") / "hooks/hooks.json"
+        projects = [self.root / name / "bin/python3" for name in ("project-a", "project-b")]
+        for path in projects:
+            path.parent.mkdir(parents=True)
+            path.write_text("")
+        self.assertEqual(self.reinstrument_in_process(projects[0]).wrapped, 4)
+        wrapped = updated.read_bytes()
+        stored = json.loads(wrapped)["hooks"]["Stop"][0]["hooks"][0]["command"]
+        # The installation's interpreter, never one project's environment baked into a shared plugin.
+        self.assertEqual(shlex.split(stored)[0], str(Path(sys.executable).resolve()))
+        manifest = (self.target / "install-manifest.json").read_bytes()
+        self.assertEqual(self.reinstrument_in_process(projects[1]).changes, [])
+        self.assertEqual(updated.read_bytes(), wrapped)
+        self.assertEqual((self.target / "install-manifest.json").read_bytes(), manifest)
+
+    def test_reinstrument_records_the_wrappers_of_an_interrupted_run(self):
+        self.install_cached_plugin("1.0.0", enable=True)
+        self.run_installer("--apply")
+        updated = self.install_cached_plugin("1.1.0") / "hooks/hooks.json"
+        sys.path.insert(0, str(ROOT))
+        self.addCleanup(sys.path.remove, str(ROOT))
+        import install
+        installation = install.Installation(self.home, self.source)
+        installation.plan_reinstrument()
+        # Interrupted after the plugin file and before the manifest.
+        updated.write_bytes(next(change["data"] for change in installation.changes if change["path"] == updated))
+        report = self.run_installer("--reinstrument", "--apply")
+        self.assertEqual((report["wrapped_hooks"], report["changed_files"]), (0, 1))
+        self.assertEqual(len([r for r in self.manifest()["wrappers"] if r["file"] == str(updated)]), 4)
+
+    def test_restoring_the_installation_names_the_later_reinstrumentation_backup(self):
+        self.install_cached_plugin("1.0.0", enable=True)
+        installed = self.run_installer("--apply")["backup_directory"]
+        updated = self.install_cached_plugin("1.1.0") / "hooks/hooks.json"
+        later = self.run_installer("--reinstrument", "--apply")["backup_directory"]
+        refused = self.run_installer("--restore", installed, "--apply", success=False)
+        self.assertIn("restore the later backup " + later + " first", refused["error"])
+        self.run_installer("--restore", later, "--apply")
+        self.run_installer("--restore", installed, "--apply")
+        self.assertEqual(json.loads(updated.read_text()), self.plugin_config)
+        self.assertFalse((self.target / "install-manifest.json").exists())
+
+    def test_reinstrument_without_an_installation_changes_nothing(self):
+        self.install_cached_plugin("1.0.0", enable=True)
+        before = snapshot(self.root)
+        report = self.run_installer("--reinstrument", "--apply")
+        self.assertEqual(report["changed_files"], 0)
+        self.assertEqual(snapshot(self.root), before)
 
     def test_identical_hook_registrations_remain_identical_for_engine_deduplication(self):
         self.settings["hooks"]["Stop"][0]["hooks"].append(self.async_shell)

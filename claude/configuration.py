@@ -28,7 +28,9 @@ def load_config(*, env=None, home=None):
         endpoint = notifications.get("endpoint", "https://ntfy.sh")
         command = opencode.get("command", "opencode")
         allow_idle = claude.get("allowIdleTeammates", False)
-        if (type(enabled) is not bool or type(allow_idle) is not bool or not isinstance(topic, str)
+        reinstrument = claude.get("reinstrumentPluginUpdates", True)
+        if (type(enabled) is not bool or type(allow_idle) is not bool or type(reinstrument) is not bool
+                or not isinstance(topic, str)
                 or (topic and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", topic)) or (enabled and not topic)
                 or not isinstance(endpoint, str) or not isinstance(command, str) or not command.strip()
                 or len(command) > 4096 or re.search(r"[\r\n\x00]", command)):
@@ -39,6 +41,7 @@ def load_config(*, env=None, home=None):
             raise ValueError()
         _ = url.port  # Invalid ports raise ValueError without echoing the URL.
         return {"notifications": {"enabled": enabled, "topic": topic, "endpoint": endpoint.rstrip("/")},
-                "opencode": {"command": command}, "claude": {"allowIdleTeammates": allow_idle}}
+                "opencode": {"command": command},
+                "claude": {"allowIdleTeammates": allow_idle, "reinstrumentPluginUpdates": reinstrument}}
     except (OSError, ValueError, TypeError, UnicodeError):
         raise ValueError("Invalid lifecycle configuration") from None

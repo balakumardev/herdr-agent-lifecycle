@@ -21,14 +21,16 @@ export function loadConfig({ env = process.env, home = homedir() } = {}) {
     const endpoint = notifications.endpoint === undefined ? 'https://ntfy.sh' : notifications.endpoint;
     const command = opencode.command === undefined ? 'opencode' : opencode.command;
     const allowIdleTeammates = claude.allowIdleTeammates === undefined ? false : claude.allowIdleTeammates;
+    const reinstrumentPluginUpdates = claude.reinstrumentPluginUpdates === undefined ? true : claude.reinstrumentPluginUpdates;
     if (typeof enabled !== 'boolean' || typeof allowIdleTeammates !== 'boolean' ||
+        typeof reinstrumentPluginUpdates !== 'boolean' ||
         typeof topic !== 'string' || (topic && !/^[A-Za-z0-9_-]{1,256}$/.test(topic)) || (enabled && !topic) ||
         typeof endpoint !== 'string' || typeof command !== 'string' || !command.trim() ||
         command.length > 4096 || /[\r\n\0]/.test(command)) throw new Error();
     const url = new URL(endpoint);
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
     return { notifications: { enabled, topic, endpoint: endpoint.replace(/\/+$/, '') },
-      opencode: { command }, claude: { allowIdleTeammates } };
+      opencode: { command }, claude: { allowIdleTeammates, reinstrumentPluginUpdates } };
   } catch {
     throw new Error('Invalid lifecycle configuration');
   }
