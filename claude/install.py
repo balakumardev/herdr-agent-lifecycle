@@ -468,8 +468,10 @@ class Installation:
             self.python = interpreters.get(cache_identity(plugin_root, self.claude))
             self.migrate_hooks(path, plugin_root, definitions=definitions)
         # Merged even without file changes, so a run interrupted before this write heals.
-        current = {record["id"]: record for record in records if isinstance(record, dict) and "id" in record}
-        current.update((record["id"], record) for record in self.wrappers)
+        # A review shared by two matchers or files has one id and a record for each.
+        identity = lambda record: (record["id"], record.get("file"), record.get("event"), record.get("matcher"))
+        current = {identity(record): record for record in records if isinstance(record, dict) and "id" in record}
+        current.update((identity(record), record) for record in self.wrappers)
         self.change(manifest_path, json_bytes({**manifest, "wrappers": sorted(current.values(),
                                                                              key=lambda record: record["id"])}), 0o600)
 
@@ -543,8 +545,14 @@ class Installation:
                     atomic_write(change["path"], change["data"], change["mode"])
 
     def later_backup(self, path, current, restoring):
-        """The backup whose run produced this file, e.g. an automatic reinstrumentation."""
-        for metadata in sorted((self.target / "backups").glob("*/backup.json")):
+        """The newest backup whose run produced this file, e.g. an automatic reinstrumentation."""
+        found = []
+        for metadata in (self.target / "backups").glob("*/backup.json"):
+            try:
+                found.append((metadata.stat().st_mtime, metadata))
+            except OSError:
+                continue
+        for _, metadata in sorted(found, reverse=True):
             if metadata.parent.resolve() == restoring:
                 continue
             try:

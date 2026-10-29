@@ -11,11 +11,14 @@ let queuedPrompts = 0;
 let python = 'python3';
 let chain = Promise.resolve();
 let completionTimer;
-// One per module load: /reload-plugins loads a new module, /clear keeps this one.
+// One load per process, kept by /clear. /reload-plugins registers plugin hooks
+// again: this module then audits them as a new load timed before the reload. A
+// reload that changes this module loads it afresh instead, through session.start.
 let loadId;
-let reloadAdvice;
+let loadRegisteredAt;
+let restartAdvice;
 const questions = new Map();
-const RELOAD_ADVICE = 'A plugin update left this session\'s background reviews untracked: run /reload-plugins so Herdr can report Done';
+const RESTART_ADVICE = 'A plugin update left this session\'s background reviews untracked: restart Claude (exit, then claude --resume) so Herdr can report Done';
 
 function invalidate() {
   revision += 1;
@@ -77,7 +80,7 @@ async function configure($, phase) {
   let settings;
   try { settings = await $.settings.read(); } catch { settings = null; }
   const reply = await send($, {
-    action: 'configure', load_id: loadId, phase,
+    action: 'configure', load_id: loadId, registered_at: loadRegisteredAt, phase,
     // Inspected locally: only enabled plugin names and derived review ids are kept;
     // hook commands and other settings are never logged or copied into state.
     hooks: { Stop: settings ? settings.hooks?.Stop || [] : null,
@@ -92,11 +95,11 @@ async function configure($, phase) {
 
 function advise($, reply) {
   if (!reply || reply.error || reply.ignored) return;
-  const required = reply.reload_required === true;
-  if (required === reloadAdvice) return;
-  reloadAdvice = required;
+  const required = reply.restart_required === true;
+  if (required === restartAdvice) return;
+  restartAdvice = required;
   try {
-    $.ui.status(required ? RELOAD_ADVICE : undefined);
+    $.ui.status(required ? RESTART_ADVICE : undefined);
   } catch {
     // Advice only: /task-lifecycle-status and the Herdr reason say the same.
   }
@@ -106,7 +109,8 @@ export function register(on) {
   on('session.start', async ($, e, next) => {
     interactive = e.isInteractive;
     loadId = crypto.randomUUID();
-    reloadAdvice = undefined;
+    loadRegisteredAt = undefined;
+    restartAdvice = undefined;
     await bind($);
     await configure($, 'load');
     await $.command.register({ name: 'task-lifecycle-status', description: 'Show sanitized Herdr/notification lifecycle status' });
@@ -116,6 +120,15 @@ export function register(on) {
   on('command.run', { command: 'task-lifecycle-status' }, async ($) => {
     const result = await send($, { action: 'inspect' });
     return { text: JSON.stringify({ ...result, observerHealthy: healthy }) };
+  });
+
+  on('command.run', { command: 'reload-plugins' }, async ($, e, next) => {
+    const registeredAt = await $.clock.now();
+    const result = await next(e);
+    loadId = crypto.randomUUID();
+    loadRegisteredAt = registeredAt;
+    await configure($, 'reload');
+    return result;
   });
 
   on('prompt.submit', async ($, e, next) => {

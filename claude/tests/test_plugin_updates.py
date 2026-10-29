@@ -10,6 +10,7 @@ from pathlib import Path
 import shlex
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -56,7 +57,7 @@ class PluginUpdateTests(unittest.TestCase):
         self.instrument("2.0.16")
         self.sequence = 0
         self.session = "session-1"
-        self.make_runtime(reinstrument=True)
+        self.make_runtime(reinstrument=True, pid=None)
 
     def write(self, path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,11 +86,20 @@ class PluginUpdateTests(unittest.TestCase):
         self.write(self.manifest_path, {"version": 1, "wrappers": installation.wrappers})
         return {record["event"]: record["id"] for record in installation.wrappers}
 
-    def make_runtime(self, reinstrument):
+    def make_runtime(self, reinstrument, started=None, pid=4242):
+        """The runtime of one Claude process; `started` is when it registered its hooks."""
         hook = (lambda: self.module.reinstrument_plugins(self.claude)) if reinstrument else None
         self.transport = CaptureTransport()
+        process = None if started is None and pid is None else [pid, started]
         self.runtime = self.module.Runtime(self.state, self.transport, env={"CLAUDE_CONFIG_DIR": str(self.claude)},
-                                           reinstrument=hook)
+                                           reinstrument=hook, claude_process=lambda: process)
+
+    def moment(self):
+        """A time clearly between the file writes before and after it, even with coarse file clocks."""
+        time.sleep(0.05)
+        moment = time.time()
+        time.sleep(0.05)
+        return moment
 
     def accept(self, action, owner, **data):
         self.sequence += 1
@@ -102,9 +112,9 @@ class PluginUpdateTests(unittest.TestCase):
         self.accept("bind", owner, born_at=born_at)
         return self.configure(owner, load_id, "load")
 
-    def configure(self, owner, load_id, phase):
+    def configure(self, owner, load_id, phase, registered_at=None):
         settings = json.loads((self.claude / "settings.json").read_text())
-        return self.accept("configure", owner, load_id=load_id, phase=phase,
+        return self.accept("configure", owner, load_id=load_id, phase=phase, registered_at=registered_at,
                            hooks={"Stop": [], "SubagentStop": [], "PostToolUse": [], "UserPromptSubmit": []},
                            enabled_plugins=settings["enabledPlugins"])
 
@@ -112,16 +122,21 @@ class PluginUpdateTests(unittest.TestCase):
         return {"session_id": self.session, "hook_event_name": "Stop", "prompt_id": key,
                 "background_tasks": [], "session_crons": []}
 
-    def finish_turn(self, owner, turn_id, review_ran):
+    def run_review(self, owner, event, hook_id):
+        runner = self.module.Runtime(self.state, self.transport,
+                                     env={"CLAUDE_TASK_LIFECYCLE_OWNER": owner, "CLAUDE_CONFIG_DIR": str(self.claude)})
+        run_id = runner.begin_hook(self.session, self.module.event_fingerprint(event), hook_id)
+        self.assertTrue(run_id, "the loaded wrapper could not record its review")
+        runner.finish_hook(self.session, run_id, 0)
+
+    def finish_turn(self, owner, turn_id, review_ran, review_first=False):
         """Stop snapshot, the wrapped review when the session loaded one, then the native boundary."""
         event = self.stop_event(turn_id)
+        if review_ran is not None and review_first:
+            self.run_review(owner, event, review_ran)  # Concurrent hooks: the review can win the race.
         self.runtime.observe_hook(event)
-        if review_ran is not None:
-            runner = self.module.Runtime(self.state, self.transport,
-                                         env={"CLAUDE_TASK_LIFECYCLE_OWNER": owner, "CLAUDE_CONFIG_DIR": str(self.claude)})
-            run_id = runner.begin_hook(self.session, self.module.event_fingerprint(event), review_ran)
-            self.assertTrue(run_id, "the loaded wrapper could not record its review")
-            runner.finish_hook(self.session, run_id, 0)
+        if review_ran is not None and not review_first:
+            self.run_review(owner, event, review_ran)
         return self.accept("complete", owner, turn_id=turn_id, reason="answer", post_turn=True,
                            has_answer=True, answer_text="Final answer")
 
@@ -162,19 +177,133 @@ class PluginUpdateTests(unittest.TestCase):
         result = self.finish_turn("owner-2", "turn-1", review_ran=current["Stop"])
         self.assertEqual((result["state"], result["reason"]), ("idle", "task_complete"))
 
-    def test_a_session_that_loaded_unwrapped_reviews_waits_for_a_plugin_reload(self):
+    def test_a_session_that_loaded_unwrapped_reviews_is_told_to_restart(self):
         self.install_version("2.0.17")
         configured = self.load("owner-1", "load-1", born_at=100)
-        self.assertIs(configured["reload_required"], True)
+        self.assertIs(configured["restart_required"], True)
         self.accept("start", "owner-1", turn_id="turn-1")
         result = self.finish_turn("owner-1", "turn-1", review_ran=None)
-        self.assertEqual((result["state"], result["reason"]), ("working", "reload_plugins_required"))
-        # /reload-plugins re-runs session.start: a new owner and module load.
-        reloaded = self.load("owner-2", "load-2", born_at=200)
-        self.assertIs(reloaded["reload_required"], False)
+        self.assertEqual((result["state"], result["reason"]), ("working", "restart_required"))
+        # A restart (claude --resume) is a new process: a new owner and load.
+        restarted = self.load("owner-2", "load-2", born_at=200)
+        self.assertIs(restarted["restart_required"], False)
         self.accept("start", "owner-2", turn_id="turn-2")
         result = self.finish_turn("owner-2", "turn-2", review_ran=self.wrapped_ids("2.0.17")["Stop"])
         self.assertEqual((result["state"], result["reason"]), ("idle", "task_complete"))
+
+    def test_an_observer_reloaded_in_the_same_process_keeps_untracked_reviews_pending(self):
+        self.make_runtime(reinstrument=True)  # One Claude process throughout.
+        other = self.claude / "plugins/cache/community/background-review/1.0.0"
+        self.write(other / ".claude-plugin/plugin.json", {"name": "background-review"})
+        self.write(other / "hooks/hooks.json", {"hooks": {"Stop": [{"hooks": [dict(REVIEW)]}]}})
+        registry = json.loads(self.registry.read_text())
+        registry["plugins"]["background-review@community"] = [{"scope": "user", "installPath": str(other)}]
+        self.write(self.registry, registry)
+        self.write(self.claude / "settings.json", {"enabledPlugins": {PLUGIN: True, "background-review@community": True}})
+        loaded = self.wrapped_ids("2.0.16")["Stop"]
+        self.load("owner-1", "load-1", born_at=100)
+        self.accept("start", "owner-1", turn_id="turn-1")
+        result = self.finish_turn("owner-1", "turn-1", review_ran=loaded)
+        self.assertEqual((result["state"], result["reason"]), ("working", "untracked_async_hook"))
+        # The uninstrumented review may still run after the plugin is disabled and
+        # /reload-plugins starts a changed observer: a new owner in the same process.
+        self.write(self.claude / "settings.json", {"enabledPlugins": {PLUGIN: True}})
+        self.assertIs(self.load("owner-2", "load-2", born_at=200)["restart_required"], True)
+        self.accept("start", "owner-2", turn_id="turn-2")
+        result = self.finish_turn("owner-2", "turn-2", review_ran=loaded)
+        self.assertEqual((result["state"], result["reason"]), ("working", "restart_required"))
+
+    def test_reload_plugins_registers_the_rewrapped_update_as_a_new_load(self):
+        self.load("owner-1", "load-1", born_at=100)
+        self.install_version("2.0.17")
+        self.accept("start", "owner-1", turn_id="turn-1")
+        self.configure("owner-1", "load-1", "turn")  # Re-wraps 2.0.17 for later loads.
+        self.finish_turn("owner-1", "turn-1", review_ran=self.wrapped_ids("2.0.16")["Stop"])
+        # /reload-plugins keeps the module and owner; the module reports a load timed before it.
+        reloaded = self.configure("owner-1", "load-2", "reload", registered_at=int(self.moment() * 1000))
+        self.assertIs(reloaded["restart_required"], False)
+        self.accept("start", "owner-1", turn_id="turn-2")
+        self.configure("owner-1", "load-2", "turn")
+        result = self.finish_turn("owner-1", "turn-2", review_ran=self.wrapped_ids("2.0.17")["Stop"])
+        self.assertEqual((result["state"], result["reason"]), ("idle", "task_complete"))
+
+    def test_a_reload_that_registered_an_unwrapped_update_is_told_to_restart(self):
+        self.load("owner-1", "load-1", born_at=100)
+        self.install_version("2.0.17")
+        # The reload runs before any turn re-wrapped the update; its own configure re-wraps after.
+        reloaded = self.configure("owner-1", "load-2", "reload", registered_at=int(self.moment() * 1000))
+        self.assertIs(reloaded["restart_required"], True)
+        self.accept("start", "owner-1", turn_id="turn-1")
+        result = self.finish_turn("owner-1", "turn-1", review_ran=None)
+        self.assertEqual((result["state"], result["reason"]), ("working", "restart_required"))
+
+    def test_a_reload_before_another_session_rewrapped_the_update_is_told_to_restart(self):
+        self.load("owner-1", "load-1", born_at=100)
+        self.install_version("2.0.17")
+        registered = self.moment()  # The reload registered 2.0.17 unwrapped.
+        self.session, owner = "session-2", "owner-2"
+        self.load(owner, "load-2", born_at=200)  # Another session's load re-wraps 2.0.17 meanwhile.
+        self.session = "session-1"
+        self.runtime.env["CLAUDE_TASK_LIFECYCLE_OWNER"] = "owner-1"
+        reloaded = self.configure("owner-1", "load-3", "reload", registered_at=int(registered * 1000))
+        self.assertIs(reloaded["restart_required"], True)
+        self.accept("start", "owner-1", turn_id="turn-1")
+        result = self.finish_turn("owner-1", "turn-1", review_ran=None)
+        self.assertEqual((result["state"], result["reason"]), ("working", "restart_required"))
+
+    def test_a_session_that_started_before_another_rewrapped_the_update_is_told_to_restart(self):
+        self.install_version("2.0.17")
+        started = self.moment()  # This process registered 2.0.17 unwrapped.
+        self.load("owner-1", "load-1", born_at=100)  # Another session's load re-wraps 2.0.17.
+        self.assertTrue(self.wrapped_ids("2.0.17")["Stop"])
+        self.session = "session-2"
+        self.make_runtime(reinstrument=True, started=started)
+        configured = self.load("owner-2", "load-2", born_at=200)
+        self.assertIs(configured["restart_required"], True)
+        self.accept("start", "owner-2", turn_id="turn-1")
+        result = self.finish_turn("owner-2", "turn-1", review_ran=None)
+        self.assertEqual((result["state"], result["reason"]), ("working", "restart_required"))
+        self.make_runtime(reinstrument=True, started=self.moment())
+        self.assertIs(self.load("owner-3", "load-3", born_at=300)["restart_required"], False)
+        self.accept("start", "owner-3", turn_id="turn-2")
+        result = self.finish_turn("owner-3", "turn-2", review_ran=self.wrapped_ids("2.0.17")["Stop"])
+        self.assertEqual((result["state"], result["reason"]), ("idle", "task_complete"))
+
+    def replaced_by_update(self, review_first):
+        self.load("owner-1", "load-1", born_at=100)
+        self.install_version("2.0.17")
+        self.accept("start", "owner-1", turn_id="turn-1")
+        self.configure("owner-1", "load-1", "turn")
+        # A reload the module never saw: Claude now runs the re-wrapped 2.0.17 review instead.
+        return self.finish_turn("owner-1", "turn-1", review_ran=self.wrapped_ids("2.0.17")["Stop"],
+                                review_first=review_first)
+
+    def test_an_update_that_runs_in_place_of_an_expected_review_is_told_to_restart(self):
+        result = self.replaced_by_update(review_first=False)
+        self.assertEqual((result["state"], result["reason"], result["pending_reviews"]),
+                         ("working", "restart_required", 0))
+
+    def test_an_update_that_ran_before_the_snapshot_is_told_to_restart(self):
+        result = self.replaced_by_update(review_first=True)
+        self.assertEqual((result["state"], result["reason"], result["pending_reviews"]),
+                         ("working", "restart_required", 0))
+
+    def test_another_plugins_review_does_not_replace_an_expected_one(self):
+        foreign = "async-" + "f" * 24
+        other = self.claude / "plugins/cache/community/background-review/1.0.0/hooks/hooks.json"
+        self.write(other, {"hooks": {}})
+        manifest = json.loads(self.manifest_path.read_text())
+        manifest["wrappers"].append({"id": foreign, "event": "Stop", "matcher": None, "file": str(other),
+                                     "original": dict(REVIEW), "wrapped": dict(REVIEW)})
+        self.write(self.manifest_path, manifest)
+        self.load("owner-1", "load-1", born_at=100)
+        self.accept("start", "owner-1", turn_id="turn-1")
+        event = self.stop_event("turn-1")
+        self.runtime.observe_hook(event)
+        self.run_review("owner-1", event, foreign)
+        result = self.accept("inspect", "owner-1")
+        self.assertEqual((result["state"], result["reason"], result["pending_reviews"]),
+                         ("working", "background_review", 1))
 
     def test_a_load_without_settings_rewraps_nothing_before_its_own_snapshot(self):
         self.install_version("2.0.17")
@@ -186,10 +315,10 @@ class PluginUpdateTests(unittest.TestCase):
                     hooks={"Stop": None, "SubagentStop": None, "PostToolUse": None, "UserPromptSubmit": None})
         self.assertEqual(self.hooks_file("2.0.17").read_bytes(), before)
         self.accept("start", "owner-1", turn_id="turn-1")
-        self.assertIs(self.configure("owner-1", "load-1", "turn")["reload_required"], True)
+        self.assertIs(self.configure("owner-1", "load-1", "turn")["restart_required"], True)
         result = self.finish_turn("owner-1", "turn-1", review_ran=None)
-        self.assertEqual((result["state"], result["reason"]), ("working", "reload_plugins_required"))
-        self.assertIs(self.load("owner-2", "load-2", born_at=200)["reload_required"], False)
+        self.assertEqual((result["state"], result["reason"]), ("working", "restart_required"))
+        self.assertIs(self.load("owner-2", "load-2", born_at=200)["restart_required"], False)
         self.accept("start", "owner-2", turn_id="turn-2")
         result = self.finish_turn("owner-2", "turn-2", review_ran=self.wrapped_ids("2.0.17")["Stop"])
         self.assertEqual((result["state"], result["reason"]), ("idle", "task_complete"))
@@ -199,7 +328,7 @@ class PluginUpdateTests(unittest.TestCase):
         self.install_version("2.0.17")
         before = self.hooks_file("2.0.17").read_bytes()
         configured = self.load("owner-1", "load-1", born_at=100)
-        self.assertIs(configured["reload_required"], False)
+        self.assertIs(configured["restart_required"], False)
         self.accept("start", "owner-1", turn_id="turn-1")
         self.configure("owner-1", "load-1", "turn")
         result = self.finish_turn("owner-1", "turn-1", review_ran=None)
@@ -217,7 +346,7 @@ class PluginUpdateTests(unittest.TestCase):
         before = (other / "hooks/hooks.json").read_bytes()
         configured = self.load("owner-1", "load-1", born_at=100)
         self.assertEqual((other / "hooks/hooks.json").read_bytes(), before)
-        self.assertIs(configured["reload_required"], False)
+        self.assertIs(configured["restart_required"], False)
         self.accept("start", "owner-1", turn_id="turn-1")
         result = self.finish_turn("owner-1", "turn-1", review_ran=self.wrapped_ids("2.0.16")["Stop"])
         self.assertEqual((result["state"], result["reason"]), ("working", "untracked_async_hook"))
@@ -261,14 +390,14 @@ class PluginUpdateTests(unittest.TestCase):
         result = self.finish_turn("owner-1", "turn-1", review_ran=self.wrapped_ids("2.0.16")["Stop"])
         self.assertEqual((result["state"], result["reason"]), ("idle", "task_complete"))
 
-    def test_status_names_the_reload_remedy(self):
+    def test_status_names_the_restart_remedy(self):
         self.install_version("2.0.17")
         self.runtime.env.update({"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1",
                                  "HERDR_SOCKET_PATH": str(self.state / "herdr.sock")})
         self.load("owner-1", "load-1", born_at=100)
         self.runtime.observe_hook(self.stop_event("turn-1"))
-        self.assertEqual(self.transport.reports[-1]["reason"], "reload_plugins_required")
-        self.assertEqual(self.accept("inspect", "owner-1")["reason"], "reload_plugins_required")
+        self.assertEqual(self.transport.reports[-1]["reason"], "restart_required")
+        self.assertEqual(self.accept("inspect", "owner-1")["reason"], "restart_required")
 
 
 if __name__ == "__main__":

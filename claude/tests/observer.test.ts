@@ -221,8 +221,12 @@ test('a failed configuration audit is not healed by the following start receipt'
   expect(packets.find(p => p.action === 'complete').has_answer).toBe(false);
 });
 
-test('turns share their module load and a plugin reload starts a new one', async ($, on) => {
-  const { packets } = setup(on);
+test('turns share their module load, /reload-plugins starts one timed before it, and a restart another', async ($, on) => {
+  const { packets, clock } = setup(on);
+  on('command.run', { command: 'reload-plugins' }, async () => {
+    await clock.advance(250);
+    return { text: 'Reloaded: 1 plugin' };
+  });
   await $.session.start(START);
   await $.turn.start({ turnId: 'turn-1', text: 'Work' });
   const [load, turn] = packets.filter(p => p.action === 'configure');
@@ -230,32 +234,44 @@ test('turns share their module load and a plugin reload starts a new one', async
   expect(turn.phase).toBe('turn');
   expect(typeof load.load_id).toBe('string');
   expect(turn.load_id).toBe(load.load_id);
-  await $.session.start(START);
+  expect(load.registered_at).toBe(undefined);
+  const answer = await $.command.run({ command: 'reload-plugins', args: '' });
+  expect(JSON.stringify(answer)).toContain('Reloaded: 1 plugin');
   const reloaded = packets.filter(p => p.action === 'configure').at(-1);
-  expect(reloaded.phase).toBe('load');
+  expect(reloaded.phase).toBe('reload');
   expect(reloaded.load_id).not.toBe(load.load_id);
+  expect(reloaded.registered_at).toBe(1000);
+  expect(reloaded.owner).toBe(load.owner);
+  await $.turn.start({ turnId: 'turn-2', text: 'More' });
+  const next = packets.filter(p => p.action === 'configure').at(-1);
+  expect([next.load_id, next.registered_at]).toEqual([reloaded.load_id, 1000]);
+  await $.session.start(START);
+  const restarted = packets.filter(p => p.action === 'configure').at(-1);
+  expect(restarted.phase).toBe('load');
+  expect([reloaded.load_id, load.load_id]).not.toContain(restarted.load_id);
+  expect(restarted.registered_at).toBe(undefined);
 });
 
-test('untracked loaded reviews pin the reload advice until a reload clears it', async ($, on) => {
-  const options = { configureReply: () => ({ configured: true, reload_required: true }) };
+test('untracked loaded reviews pin the restart advice until a restart clears it', async ($, on) => {
+  const options = { configureReply: () => ({ configured: true, restart_required: true }) };
   const { statuses } = setup(on, options);
   await $.session.start(START);
   expect(statuses.length).toBe(1);
-  expect(statuses[0]).toContain('/reload-plugins');
+  expect(statuses[0]).toContain('restart Claude');
   await $.turn.start({ turnId: 'turn-1', text: 'Work' });
   expect(statuses.length).toBe(1);
-  options.configureReply = () => ({ configured: true, reload_required: false });
+  options.configureReply = () => ({ configured: true, restart_required: false });
   await $.session.start(START);
   expect(statuses.length).toBe(2);
   expect(statuses[1]).toBe(undefined);
 });
 
-test('a failed configuration keeps the current reload advice', async ($, on) => {
-  const options = { configureReply: () => ({ configured: true, reload_required: true }) };
+test('a failed configuration keeps the current restart advice', async ($, on) => {
+  const options = { configureReply: () => ({ configured: true, restart_required: true }) };
   const { statuses } = setup(on, options);
   await $.session.start(START);
   options.configureReply = () => ({ error: 'lifecycle_unavailable' });
   await $.turn.start({ turnId: 'turn-1', text: 'Work' });
   expect(statuses.length).toBe(1);
-  expect(statuses[0]).toContain('/reload-plugins');
+  expect(statuses[0]).toContain('restart Claude');
 });

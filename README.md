@@ -94,10 +94,13 @@ claude plugin marketplace update herdr-agent-lifecycle
 claude plugin update task-lifecycle@herdr-agent-lifecycle --scope user
 ```
 
-Sessions that were already open keep the previous observer, which audits review
-hooks as currently installed. Run `/reload-plugins` in each before its next
-prompt, or start a new session. A session that runs a turn first may report
-`unsettled_previous_run` after the reload; `/clear` it.
+Sessions that were already open keep their observer module until
+`/reload-plugins` or a restart (exit, then `claude --resume`) loads the new one.
+With the staged local marketplace, their Python runtime switches at once. A
+session whose plugin hooks changed after it started, or that ran an untracked
+review before the reload, then reports `restart_required`; restart it. A resumed
+session may report `unsettled_previous_run` for a review the previous observer
+expected; `/clear` it.
 
 Updates of another plugin that owns `asyncRewake` reviews are re-instrumented
 automatically; see [Claude plugin updates](#claude-plugin-updates). Run the
@@ -166,17 +169,24 @@ installer wraps 2.0.16 reviews ──> Claude auto-updates to 2.0.17 (unwrapped)
 ```
 
 - A running session keeps the hooks it loaded. Its completion follows those
-  hooks, not the newly installed version.
+  hooks, not the newly installed version. `/reload-plugins` registers the
+  installed versions again, and the observer then audits those.
 - Only plugins whose earlier versions the installer instrumented are re-wrapped,
-  with the same private backups. Existing wrappers are left as they are, and new
-  ones use the interpreter the installation recorded. A newly installed plugin
-  still needs the installer. Run `python3 claude/install.py --reinstrument` to
-  preview this step, or add `--apply` to run it yourself.
+  with the same private backups. Existing wrappers are left as they are. New
+  ones use the interpreter the installation recorded, or the observer's own if
+  that one is gone. A newly installed plugin still needs the installer. Run
+  `python3 claude/install.py --reinstrument` to preview this step, or add
+  `--apply` to run it yourself.
 - Restore backups newest first. `--restore` names a later automatic backup that
-  has to be restored before an earlier one.
-- A session that loaded the unwrapped version stays Working with reason
-  `reload_plugins_required`, and a status line asks you to run
-  `/reload-plugins`. The reload registers the instrumented hooks.
+  has to be restored before an earlier one. Open sessions re-wrap at their next
+  turn, so close them, or set `reinstrumentPluginUpdates` to `false`, first.
+- A session whose Claude registered an unwrapped version stays Working with
+  reason `restart_required`, and a status line asks you to restart Claude (exit,
+  then `claude --resume`). This includes a session that started, or ran
+  `/reload-plugins`, just before another session re-wrapped the update, and one
+  that runs another version of a plugin than its observer recorded. A restart
+  registers the wrapped version. After the first prompt, `/reload-plugins` does
+  not clear the reason: a review that ran untracked may still be running.
 
 Set `claude.reinstrumentPluginUpdates` to the boolean `false` to turn this off.
 Updated reviews then stay `untracked_async_hook` until you rerun the installer.

@@ -64,6 +64,46 @@ def load_json(path, default):
         return default
 
 
+def plugin_versions(records, config_dir):
+    """Marketplace, plugin and version of each wrapper in a version Claude installed under plugins/cache."""
+    cache = (Path(config_dir) / "plugins/cache").resolve()
+    versions = {}
+    for record in records:
+        try:
+            parts = Path(record["file"]).resolve().relative_to(cache).parts
+            if len(parts) >= 4:
+                versions[record["id"]] = list(parts[:3])
+        except (KeyError, TypeError, ValueError, OSError):
+            continue
+    return versions
+
+
+def written_since(path, moment):
+    """Whether a file was written at or after `moment`; copying cannot backdate an inode change."""
+    try:
+        info = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return True
+    return max(info.st_mtime, info.st_ctime) >= moment
+
+
+def started_at(pid):
+    """When a process started, in epoch seconds rounded down; None if the platform cannot say."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+                    if line.startswith("btime "))
+        return boot + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        pass
+    try:
+        started = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                                 timeout=2, env={**os.environ, "LC_ALL": "C"}, check=False).stdout.strip()
+        return time.mktime(time.strptime(started, "%a %b %d %H:%M:%S %Y"))
+    except (OSError, ValueError, OverflowError, subprocess.SubprocessError):
+        return None
+
+
 def classify(state):
     if state.get("questions"):
         return "blocked", "user_question"
@@ -77,8 +117,8 @@ def classify(state):
            for item in state["reviews"].values()):
         return "blocked", "unsettled_previous_run"
     if state.get("unknown_hook"):
-        # The loaded hooks are uninstrumented, but their installed versions are not.
-        return "working", "reload_plugins_required" if state.get("reload_required") else "untracked_async_hook"
+        # A restart registers the installed versions, which the last audit found all tracked.
+        return "working", "restart_required" if state.get("restart_clears") else "untracked_async_hook"
     if any(state.get("unknown_dispatches", {}).values()):
         return "working", "review_applicability_unknown"
     if any(item["status"] in ("expected", "running") for item in state["reviews"].values()):
@@ -214,7 +254,7 @@ def audit_hooks(event, config_dir=None):
 
 class Runtime:
     def __init__(self, state_dir, transport, *, env=None, hook_audit=audit_hooks, background_delivery=False,
-                 allow_idle_teammates=False, reinstrument=None):
+                 allow_idle_teammates=False, reinstrument=None, claude_process=None):
         self.root = Path(state_dir)
         self.transport = transport
         self.env = dict(os.environ if env is None else env)
@@ -222,13 +262,22 @@ class Runtime:
         self.background_delivery = background_delivery
         self.allow_idle_teammates = allow_idle_teammates is True
         self.reinstrument = reinstrument
+        # [pid, start time] of the Claude process; None treats each owner as a new process
+        # and trusts the hook files as they are now.
+        self.claude_process = claude_process or (lambda: None)
 
-    def _loaded_plugins(self, load_id, enabled, records, settings_available):
-        """Plugin hooks as registered for this native module load.
+    def config_dir(self):
+        return Path(self.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 
-        Claude keeps a session's plugin hooks until /reload-plugins, even after a
-        background update installs another version; /clear keeps them too. This
-        load re-wraps nothing before its snapshot exists.
+    def _loaded_plugins(self, load_id, enabled, records, settings_available, registered_at):
+        """Plugin hooks as Claude registered them for this load.
+
+        Claude registers plugin hooks at process start and keeps them after a
+        background update installs another version; /clear keeps them too.
+        /reload-plugins registers the installed versions again, which the module
+        reports as a new load. Claude read the hook files before this snapshot,
+        so a file written since then may not be what it registered: its reviews
+        count as untracked. This load re-wraps nothing before its snapshot exists.
         """
         if not isinstance(load_id, str) or not load_id or len(load_id) > 256:
             return None
@@ -243,18 +292,28 @@ class Runtime:
         if not settings_available or not isinstance(enabled, dict):
             return None  # The loaded plugin set is unknown: keep auditing live.
         names = sorted(name for name, flag in enabled.items() if flag)
+        moment = registered_at()
+        files = {}
+        for record in records:
+            if isinstance(record, dict):
+                files.setdefault(record.get("id"), []).append(record.get("file"))
         events = {}
         for name in AUDITED_EVENTS:
             expected, unknown = self.hook_audit({"hook_event_name": name, "effective_hooks": [],
                                                  "enabled_plugins": {plugin: True for plugin in names}})
-            events[name] = {"expected": expected, "unknown": unknown}
+            # An update or another session's re-wrap after registration (when the time is known).
+            rewritten = {identifier for identifier in expected if moment is not None
+                         and any(written_since(file, moment) for file in files.get(identifier, [None]))}
+            events[name] = {"expected": [identifier for identifier in expected if identifier not in rewritten],
+                            "unknown": unknown or bool(rewritten)}
         identifiers = {identifier for item in events.values() for identifier in item["expected"]}
         known = {record["id"]: record for record in records
                  if isinstance(record, dict) and record.get("id") in identifiers}
-        # Keep the loaded matchers and conditions: a later installer run drops old records.
+        # Keep the loaded matchers, conditions and versions: a later installer run drops old records.
         snapshot = {"schema": 1, "enabled": names, "events": events,
                     "matchers": {key: record.get("matcher") or "" for key, record in known.items()},
-                    "conditions": {key: (record.get("original") or {}).get("if") for key, record in known.items()}}
+                    "conditions": {key: (record.get("original") or {}).get("if") for key, record in known.items()},
+                    "versions": plugin_versions(known.values(), self.config_dir())}
         save_json(path, snapshot)
         cutoff = time.time() - LOAD_RETENTION_SECONDS
         for old in path.parent.glob("*.json"):
@@ -507,15 +566,34 @@ class Runtime:
         state["final_notice"] = None
         state["teammate_completion_unproven"] = False
 
+    def _plugin_versions(self, state):
+        records = load_json(self.config_dir() / "hooks/task-lifecycle/install-manifest.json", {}).get("wrappers", [])
+        current = plugin_versions(records if isinstance(records, list) else [], self.config_dir())
+        # Snapshot versions outlive the records a later full installer run drops.
+        return {**current, **state.get("hook_versions", {})}
+
+    @staticmethod
+    def _replaces(versions, newer, older):
+        """A wrapper from another version of the plugin whose review was expected."""
+        a, b = versions.get(newer), versions.get(older)
+        return newer != older and a is not None and b is not None and a[:2] == b[:2] and a[2] != b[2]
+
     def _prepare(self, state, event, expected, unknown):
         state["unknown_hook"] = bool(unknown) or state.get("unknown_hook", False)
+        unclaimed = [item for item in state["reviews"].values()
+                     if item["event_key"] == event["event_key"] and not item.get("snapshot_seen")]
+        versions = self._plugin_versions(state) if any(item["hook_id"] not in expected for item in unclaimed) else {}
         for hook in expected:
             # Classic command hooks run concurrently. A review can start AND
             # finish before our snapshot command gets CPU. Claim that same run
             # once; an earlier, already-observed Stop is a different dispatch.
-            unmatched = next((item for item in state["reviews"].values()
-                              if item["hook_id"] == hook and item["event_key"] == event["event_key"]
-                              and not item.get("snapshot_seen")), None)
+            unmatched = next((item for item in unclaimed
+                              if item["hook_id"] == hook and not item.get("snapshot_seen")), None)
+            if unmatched is None:
+                # Another version of the plugin ran instead: Claude registered it after the snapshot.
+                unmatched = next((item for item in unclaimed if not item.get("snapshot_seen")
+                                  and self._replaces(versions, item["hook_id"], hook)), None)
+                state["unknown_hook"] = state["unknown_hook"] or unmatched is not None
             if unmatched:
                 unmatched["snapshot_seen"] = True
             else:
@@ -565,8 +643,7 @@ class Runtime:
                 else:
                     expected, unknown = self.hook_audit(event)
                 key = event_fingerprint(event)
-                config_dir = Path(self.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-                records = load_json(config_dir / "hooks/task-lifecycle/install-manifest.json", {}).get("wrappers", [])
+                records = load_json(self.config_dir() / "hooks/task-lifecycle/install-manifest.json", {}).get("wrappers", [])
                 by_id = {record["id"]: record for record in records}
                 applicable, uncertain = [], []
                 for identifier in expected:
@@ -619,10 +696,13 @@ class Runtime:
                             return {"ignored": True, "reason": "old_pane_owner"}
                         save_json(pane_path, {"owner": event["owner"], "session_id": session_id,
                                               "born_at": born, "report_seq": pane.get("report_seq", 0)})
-                state.update(owner=event["owner"], born_at=born, seq=event["seq"],
+                process = self.claude_process()
+                # A new process registers its own hooks; its configure re-audits them. An observer
+                # reloaded in the same process inherits the reviews that already ran untracked.
+                untracked = state.get("unknown_hook", False) if process is not None and state.get("process") == process else False
+                state.update(owner=event["owner"], born_at=born, seq=event["seq"], process=process,
                              running=False, closed=False, failure=None, questions=[], permissions=[], children=[],
-                             # A new module load registers its own hooks; its configure re-audits them.
-                             unknown_hook=False, reload_required=False)
+                             unknown_hook=untracked, restart_clears=False)
                 self._invalidate(state)
                 state["herdr"] = herdr
                 save_json(self.path(session_id), state)
@@ -635,12 +715,15 @@ class Runtime:
             state["seq"] = event["seq"]
             if action == "configure":
                 inventory = {}
-                config_dir = Path(self.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-                wrappers = load_json(config_dir / "hooks/task-lifecycle/install-manifest.json", {}).get("wrappers", [])
+                wrappers = load_json(self.config_dir() / "hooks/task-lifecycle/install-manifest.json", {}).get("wrappers", [])
                 hooks = event.get("hooks", {})
                 enabled = event.get("enabled_plugins", {})
+                registered = event.get("registered_at")
+                # The module times /reload-plugins; a process registers its hooks when it starts.
+                registered_at = ((lambda: registered / 1000) if type(registered) in (int, float) and registered > 0
+                                 else lambda: (self.claude_process() or [None, None])[1])
                 loaded = self._loaded_plugins(event.get("load_id"), enabled, wrappers,
-                                              isinstance(hooks.get("Stop"), list))
+                                              isinstance(hooks.get("Stop"), list), registered_at)
                 matchers = {record["id"]: record.get("matcher", "") for record in wrappers}
                 conditions = {}
                 live_plugins = enabled
@@ -661,19 +744,22 @@ class Runtime:
                     inventory[name] = {"expected": expected, "unknown": unknown,
                                        "matchers": matchers, "conditions": conditions}
                 state["hook_inventory"] = inventory
+                state["hook_versions"] = loaded.get("versions", {}) if loaded is not None else {}
                 # Never before this load has its own snapshot; later loads register the re-wrapped files.
-                if loaded is not None and event.get("phase") in ("load", "turn") and self.reinstrument is not None:
+                if loaded is not None and event.get("phase") in ("load", "turn", "reload") and self.reinstrument is not None:
                     self.reinstrument()
-                reload_required = False
-                if loaded is not None and any(loaded["events"][name]["unknown"] for name in AUDITED_EVENTS):
-                    # /reload-plugins registers the currently installed versions instead.
-                    current = {plugin: True for plugin in loaded["enabled"]}
-                    reload_required = not any(
-                        self.hook_audit({"hook_event_name": name, "effective_hooks": [], "enabled_plugins": current})[1]
-                        for name in AUDITED_EVENTS if loaded["events"][name]["unknown"])
-                state["reload_required"] = reload_required
+                stale = bool(state.get("unknown_hook") or any(item["unknown"] for item in inventory.values()))
+                if loaded is None:
+                    state["restart_clears"] = False
+                elif stale or event.get("phase") != "step":
+                    # A new process registers the installed versions, which may all be wrapped by now.
+                    current = {plugin: True for plugin, flag in enabled.items() if flag} if isinstance(enabled, dict) else {}
+                    state["restart_clears"] = not any(
+                        self.hook_audit({"hook_event_name": name, "effective_hooks": hooks.get(name, []),
+                                         "enabled_plugins": current})[1] for name in AUDITED_EVENTS)
+                restart_required = stale and state.get("restart_clears", False)
                 save_json(self.path(session_id), state)
-                return {"configured": True, "reload_required": reload_required}
+                return {"configured": True, "restart_required": restart_required}
             elif action in ("start", "activity", "child_start", "child_complete"):
                 self._invalidate(state)
                 state["closed"] = False
@@ -770,6 +856,15 @@ class Runtime:
             was_expected = hook_id in uncertain
             if was_expected:
                 uncertain.remove(hook_id)
+            waiting = [key for key, item in state["reviews"].items()
+                       if item["event_key"] == event_key and item["status"] == "expected"
+                       and item.get("owner") == invoking_owner]
+            versions = self._plugin_versions(state) if waiting else {}
+            replaced = [key for key in waiting if self._replaces(versions, hook_id, state["reviews"][key]["hook_id"])]
+            for key in replaced:
+                # Claude registered another version of this plugin after the snapshot.
+                del state["reviews"][key]
+            state["unknown_hook"] = state.get("unknown_hook", False) or bool(replaced)
             state["reviews"][run_id] = {"event_key": event_key, "hook_id": hook_id,
                                         "status": "running", "owner": state.get("owner"), "snapshot_seen": was_expected}
             if not was_expected:
@@ -838,7 +933,9 @@ def default_runtime():
     endpoint = os.environ.get("CLAUDE_TASK_LIFECYCLE_ENDPOINT", notification["endpoint"])
     return Runtime(root, Transport(root, topic_file, endpoint=endpoint, topic=topic), background_delivery=True,
                    allow_idle_teammates=config["claude"]["allowIdleTeammates"],
-                   reinstrument=reinstrument_plugins if config["claude"]["reinstrumentPluginUpdates"] else None)
+                   reinstrument=reinstrument_plugins if config["claude"]["reinstrumentPluginUpdates"] else None,
+                   # Native configure runs as a child of the Claude process that registered the hooks.
+                   claude_process=lambda: [os.getppid(), started_at(os.getppid())])
 
 
 def begin_hook(hook_input, hook_id):

@@ -470,6 +470,55 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(updated.read_bytes(), wrapped)
         self.assertEqual((self.target / "install-manifest.json").read_bytes(), manifest)
 
+    def test_reinstrument_keeps_wrappers_after_their_interpreter_is_gone(self):
+        sys.path.insert(0, str(ROOT))
+        self.addCleanup(sys.path.remove, str(ROOT))
+        import install
+        recorded, project = (self.root / name / "bin/python3" for name in ("removed", "project"))
+        for path in (recorded, project):
+            path.parent.mkdir(parents=True)
+            path.write_text("")
+        self.install_cached_plugin("1.0.0", enable=True)
+        installation = install.Installation(self.home, self.source)
+        installation.python = recorded  # The installation ran under an interpreter removed later.
+        installation.plan()
+        installation.apply()
+        updated = self.install_cached_plugin("1.1.0") / "hooks/hooks.json"
+        self.reinstrument_in_process(project)
+        wrapped = updated.read_bytes()
+        stored = json.loads(wrapped)["hooks"]["Stop"][0]["hooks"][0]["command"]
+        self.assertEqual(shlex.split(stored)[0], str(recorded))
+        recorded.unlink()
+        # New versions would now fall back to the observer's interpreter; existing wrappers stay.
+        self.assertEqual(self.reinstrument_in_process(project).changes, [])
+        self.assertEqual(updated.read_bytes(), wrapped)
+
+    def test_reinstrument_keeps_every_record_of_a_review_shared_by_two_matchers(self):
+        self.plugin_config["hooks"]["PostToolUse"].append({"matcher": "Edit", "hooks": [self.plugin_hook]})
+        self.install_cached_plugin("1.0.0", enable=True)
+        self.run_installer("--apply")
+        records = self.manifest()["wrappers"]
+        shared = [r for r in records if r["event"] == "PostToolUse" and "market/guard" in r["file"]]
+        self.assertEqual(len({r["id"] for r in shared}), 1)
+        self.assertEqual(len(shared), 2)
+        report = self.run_installer("--reinstrument", "--apply")
+        self.assertEqual((report["changed_files"], report["backup_directory"]), (0, None))
+        self.assertEqual(self.manifest()["wrappers"], records)
+
+    def test_restoring_names_the_newest_backup_that_produced_the_file(self):
+        self.install_cached_plugin("1.0.0", enable=True)
+        installed = self.run_installer("--apply")["backup_directory"]
+        self.install_cached_plugin("1.1.0")
+        first = Path(self.run_installer("--reinstrument", "--apply")["backup_directory"])
+        self.run_installer("--restore", str(first), "--apply")
+        # An open session re-wraps the update again: both backups produced the current files.
+        second = Path(self.run_installer("--reinstrument", "--apply")["backup_directory"])
+        older, newer = first.with_name("0" * 32), second.with_name("f" * 32)
+        first.rename(older)
+        second.rename(newer)
+        refused = self.run_installer("--restore", installed, "--apply", success=False)
+        self.assertIn("restore the later backup " + str(newer) + " first", refused["error"])
+
     def test_reinstrument_records_the_wrappers_of_an_interrupted_run(self):
         self.install_cached_plugin("1.0.0", enable=True)
         self.run_installer("--apply")
