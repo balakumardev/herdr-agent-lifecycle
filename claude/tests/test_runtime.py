@@ -478,8 +478,36 @@ class RuntimeTests(unittest.TestCase):
         self.expected = []
         self.stop(key="stop-2")
         result = self.complete(turn_id="turn-2")
-        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["state"], "working")
         self.assertEqual(result["reason"], "unsettled_previous_run")
+        self.assertEqual(result["pending_reviews"], 1)
+        self.assertEqual(self.transport.notices, [])
+
+    def test_running_resumed_session_with_old_reviews_reports_working_to_herdr(self):
+        self.runtime.env.update(HERDR_ENV="1", HERDR_PANE_ID="pane-1", HERDR_SOCKET_PATH="/test/socket")
+        self.event("bind", born_at=100)
+        self.expected = ["review"]
+        self.stop()
+        self.owner = "new-owner"
+        self.event("bind", born_at=200)
+        result = self.event("start", turn_id="turn-2")
+        self.assertEqual((result["state"], result["reason"]), ("working", "unsettled_previous_run"))
+        self.assertEqual(self.transport.reports[-1]["state"], "working")
+        self.assertEqual(result["pending_reviews"], 1)
+        self.assertEqual(self.transport.notices, [])
+
+    def test_old_reviews_do_not_hide_genuine_input_requests(self):
+        self.expected = ["review"]
+        self.stop()
+        self.owner = "new-owner"
+        self.event("bind", born_at=200)
+        self.event("start", turn_id="turn-2")
+        for kind, reason in (("question", "user_question"), ("permission", "permission_required")):
+            with self.subTest(kind=kind):
+                result = self.event(kind + "_begin", tool_id="input-1")
+                self.assertEqual((result["state"], result["reason"]), ("blocked", reason))
+                result = self.event(kind + "_end", tool_id="input-1")
+                self.assertEqual((result["state"], result["reason"]), ("working", "unsettled_previous_run"))
 
     def test_session_exit_keeps_an_already_qualified_notification_deliverable(self):
         self.runtime._dispatch = lambda *args: None  # Pause the transport boundary only.

@@ -115,7 +115,8 @@ def classify(state):
         return "blocked", "session_ended"
     if any(item["status"] in ("expected", "running") and item.get("owner") != state.get("owner")
            for item in state["reviews"].values()):
-        return "blocked", "unsettled_previous_run"
+        # Unobserved reviews still gate Done, but are not a request for user input.
+        return "working", "unsettled_previous_run"
     if state.get("unknown_hook"):
         # A restart registers the installed versions, which the last audit found all tracked.
         return "working", "restart_required" if state.get("restart_clears") else "untracked_async_hook"
