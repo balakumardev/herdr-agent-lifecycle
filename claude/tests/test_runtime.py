@@ -395,6 +395,40 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.finish_hook("session-1", run_id, 1)["state"], "blocked")
         self.assertEqual(self.transport.notices, [])
 
+    def test_review_failure_does_not_report_blocked_while_parent_keeps_running(self):
+        self.runtime.env.update(HERDR_ENV="1", HERDR_PANE_ID="pane-1", HERDR_SOCKET_PATH="/test/socket")
+        self.event("bind", born_at=100)
+        self.event("start", turn_id="turn-1")
+        run_id = self.runtime.begin_hook("session-1", "tool-review", "review")
+        result = self.runtime.finish_hook("session-1", run_id, 1)
+        self.assertEqual((result["state"], result["reason"]), ("working", "review_failed"))
+        self.assertEqual(self.transport.reports[-1]["state"], "working")
+        result = self.event("activity", parent_step=True)
+        self.assertEqual((result["state"], result["reason"]), ("working", "review_failed"))
+        stored = json.loads(self.runtime.path("session-1").read_text())
+        self.assertEqual(stored["failure"], "review_failed")
+        self.assertEqual(stored["reviews"][run_id]["status"], "error")
+        self.stop()
+        result = self.complete()
+        self.assertEqual((result["state"], result["reason"]), ("blocked", "review_failed"))
+        self.assertEqual(self.transport.notices, [])
+
+    def test_running_parent_with_review_failure_still_blocks_on_genuine_input(self):
+        run_id = self.runtime.begin_hook("session-1", "tool-review", "review")
+        self.runtime.finish_hook("session-1", run_id, 1)
+        for kind, reason in (("question", "user_question"), ("permission", "permission_required")):
+            with self.subTest(kind=kind):
+                result = self.event(kind + "_begin", tool_id="input-1")
+                self.assertEqual((result["state"], result["reason"]), ("blocked", reason))
+                result = self.event(kind + "_end", tool_id="input-1")
+                self.assertEqual((result["state"], result["reason"]), ("working", "review_failed"))
+
+    def test_session_end_with_review_failure_stays_blocked(self):
+        run_id = self.runtime.begin_hook("session-1", "tool-review", "review")
+        self.runtime.finish_hook("session-1", run_id, 1)
+        self.assertEqual(self.event("end")["state"], "blocked")
+        self.assertEqual(self.transport.notices, [])
+
     def test_state_does_not_persist_extra_payload_fields(self):
         self.event("activity", prompt="SECRET-PROMPT", tool_input={"command": "SECRET-COMMAND"})
         text = "\n".join(path.read_text() for path in self.root.rglob("*.json"))

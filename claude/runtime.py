@@ -110,6 +110,9 @@ def classify(state):
     if state.get("permissions"):
         return "blocked", "permission_required"
     if state.get("failure"):
+        # A failed background review gates Done, not an otherwise running parent.
+        if state["failure"] == "review_failed" and state.get("running") and not state.get("closed"):
+            return "working", state["failure"]
         return "blocked", state["failure"]
     if state.get("closed"):
         return "blocked", "session_ended"
