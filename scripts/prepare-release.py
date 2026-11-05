@@ -30,7 +30,7 @@ def prepare(root, version):
         updates[path] = (json.dumps(value, indent=2) + "\n").encode()
     tracked = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True).stdout
     files = {path.decode() for path in tracked.split(b"\0") if path}
-    if not {"LICENSE", "README.md", "opencode/index.js", "claude/runtime.py"}.issubset(files):
+    if not {"LICENSE", "README.md", "opencode/tui.js", "claude/background_work.py"}.issubset(files):
         raise ValueError("Prepare releases from a tracked repository checkout")
     if (root / "CHANGELOG.md").is_file():
         files.add("CHANGELOG.md")

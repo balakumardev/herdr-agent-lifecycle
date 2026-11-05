@@ -52,23 +52,26 @@ class ReleaseTests(unittest.TestCase):
             names = archive.getnames()
             self.assertTrue(all(name.startswith("herdr-agent-lifecycle-2.3.4/") for name in names))
             self.assertFalse(any("node_modules" in name or name.endswith("/.env") for name in names))
-            self.assertIn("herdr-agent-lifecycle-2.3.4/tests/fixtures/legacy-bridge.js", names)
-            self.assertIn("herdr-agent-lifecycle-2.3.4/claude/configuration.py", names)
+            self.assertIn("herdr-agent-lifecycle-2.3.4/claude/background_work.py", names)
+            self.assertIn("herdr-agent-lifecycle-2.3.4/claude/hooks/hooks.json", names)
             archive.extractall(unpack)
         extracted = unpack / "herdr-agent-lifecycle-2.3.4"
-        script = "import sys;sys.path.insert(0,'claude');from runtime import Runtime;from configuration import load_config;assert load_config(env={}, home='.')['claude']['allowIdleTeammates'] is False"
-        subprocess.run([sys.executable, "-B", "-c", script], cwd=extracted, check=True)
+        # Outside a Herdr pane the extracted hook must exit 0 and print nothing.
+        outside = subprocess.run([sys.executable, "-B", "claude/background_work.py"], cwd=extracted, check=True,
+                                 input='{"hook_event_name":"Stop"}', text=True, capture_output=True,
+                                 env={"PATH": "/usr/bin:/bin"})
+        self.assertEqual((outside.stdout, outside.stderr), ("", ""))
         with tarfile.open(dist / "opencode-herdr-lifecycle-2.3.4.tgz") as archive:
             names = set(archive.getnames())
-            self.assertTrue({"package/index.js", "package/tui.js", "package/config.mjs", "package/contract.mjs",
-                             "package/LICENSE", "package/package.json"}.issubset(names))
+            self.assertEqual({"package/tui.js", "package/herdr.mjs", "package/LICENSE", "package/README.md",
+                              "package/package.json"}, names)
             self.assertFalse(any("node_modules" in name or ".test." in name for name in names))
             package = json.loads(archive.extractfile("package/package.json").read())
             self.assertEqual(package["version"], "2.3.4")
             archive.extractall(unpack / "npm")
         subprocess.run(["node", "--input-type=module", "-e",
-            "import {loadConfig} from './config.mjs'; import {LifecycleRPC} from './contract.mjs'; "
-            "if(loadConfig({env:{},home:'.'}).notifications.enabled || LifecycleRPC.id !== 'local.task-lifecycle') process.exit(1)"],
+            "import tui from './tui.js'; import {createHerdr} from './herdr.mjs'; "
+            "if(tui.id !== 'local.task-lifecycle.tui' || createHerdr({}) !== undefined) process.exit(1)"],
             cwd=unpack / "npm/package", check=True)
 
     def test_invalid_version_fails_before_any_manifest_changes(self):

@@ -5,13 +5,13 @@
     "url": "https://github.com/balakumardev"
   },
   "metadata": {
-    "description": "Task-aware Herdr reporting for coding agents"
+    "description": "Herdr Working state for coding agents with background work"
   },
   "plugins": [
     {
       "name": "task-lifecycle",
       "source": "./claude",
-      "description": "Child-aware Herdr state and optional completion/question notifications",
+      "description": "Herdr shows Working while Claude Code has background shells or subagents",
       "version": "1.0.3"
     }
   ]

@@ -1,7 +1,7 @@
 {
   "name": "task-lifecycle",
   "version": "1.0.3",
-  "description": "Child-aware Herdr state and completion/question notifications for Claude Code",
+  "description": "Herdr shows Working while Claude Code has background shells or subagents",
   "author": {
     "name": "balakumardev",
     "url": "https://github.com/balakumardev"
@@ -11,8 +11,7 @@
   "license": "Apache-2.0",
   "keywords": [
     "herdr",
-    "notifications",
-    "lifecycle",
+    "background-tasks",
     "subagents"
   ]
 }

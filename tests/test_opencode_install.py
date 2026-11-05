@@ -23,7 +23,8 @@ class OpenCodeInstallTests(unittest.TestCase):
             {"package": "other-plugin", "options": {"enabled": True}},
             {"package": "./integrations/task-lifecycle", "options": {"refreshIntervalMs": 5000}},
         ]}
-        self.cli = {"theme": "existing-theme", "plugins": ["other-tui"]}
+        self.cli = {"theme": "existing-theme", "plugins": [
+            "other-tui", {"package": "./integrations/task-lifecycle", "options": {"refreshIntervalMs": 5000}}]}
         self.server_path.write_text(json.dumps(self.server))
         self.cli_path.write_text(json.dumps(self.cli))
 
@@ -31,12 +32,9 @@ class OpenCodeInstallTests(unittest.TestCase):
         path = self.root / name
         path.mkdir()
         (path / "package.json").write_text(json.dumps({"name": "opencode-herdr-lifecycle", "version": "1.0.0",
-            "exports": {".": "./index.js", "./tui": "./tui.js"}}))
-        for entry in ("index.js", "tui.js"):
+            "exports": {"./tui": "./tui.js"}}))
+        for entry in ("tui.js", "herdr.mjs"):
             (path / entry).write_text("export default {};\n")
-        client = path / "node_modules/@opencode/client"
-        client.mkdir(parents=True)
-        (client / "package.json").write_text('{"version":"2.0.18"}')
         return path
 
     def run_installer(self, *flags, ok=True, restore=None):
@@ -47,7 +45,7 @@ class OpenCodeInstallTests(unittest.TestCase):
         self.assertNotIn("private-fixture-model", result.stdout + result.stderr)
         return json.loads(result.stdout)
 
-    def test_registration_excludes_both_native_reporters_and_preserves_other_options(self):
+    def test_registers_the_tui_plugin_only_and_excludes_both_native_reporters(self):
         before = self.server_path.read_bytes()
         self.run_installer()
         self.assertEqual(self.server_path.read_bytes(), before)
@@ -55,12 +53,30 @@ class OpenCodeInstallTests(unittest.TestCase):
         server, cli = json.loads(self.server_path.read_text()), json.loads(self.cli_path.read_text())
         self.assertEqual(server["model"], self.server["model"])
         self.assertIn(self.server["plugins"][0], server["plugins"])
-        self.assertIn({"package": str(self.plugin), "options": {"refreshIntervalMs": 5000}}, server["plugins"])
-        self.assertIn("-herdr.opencode.agent-state", server["plugins"])
-        self.assertIn("-herdr.opencode.session-selection", cli["plugins"])
-        self.assertIn(str(self.plugin), cli["plugins"])
+        self.assertEqual(server["plugins"][-1], "-herdr.opencode.agent-state")
+        self.assertFalse(any(str(self.plugin) in json.dumps(p) or "task-lifecycle" in json.dumps(p) for p in server["plugins"]),
+                         "the TUI-only plugin must not stay registered with the server")
+        self.assertEqual(cli["plugins"][-1], "-herdr.opencode.session-selection")
+        self.assertIn("other-tui", cli["plugins"])
+        self.assertIn({"package": str(self.plugin), "options": {"refreshIntervalMs": 5000}}, cli["plugins"])
         self.assertEqual(cli["theme"], "existing-theme")
         self.assertTrue(Path(result["backupDirectory"]).is_dir())
+
+    def test_a_fresh_configuration_gets_only_the_two_directives_and_the_plugin(self):
+        self.server_path.unlink()
+        self.cli_path.unlink()
+        self.run_installer("--apply")
+        self.assertEqual(json.loads(self.server_path.read_text())["plugins"], ["-herdr.opencode.agent-state"])
+        self.assertEqual(json.loads(self.cli_path.read_text())["plugins"], [str(self.plugin), "-herdr.opencode.session-selection"])
+
+    def test_a_stale_server_registration_by_package_name_is_removed(self):
+        stale = self.ready_plugin("old-release")
+        self.server["plugins"].append({"package": str(stale), "options": {"x": 1}})
+        self.server_path.write_text(json.dumps(self.server))
+        self.run_installer("--apply")
+        server = json.loads(self.server_path.read_text())
+        self.assertFalse(any(str(stale) in json.dumps(p) for p in server["plugins"]))
+        self.assertIn(self.server["plugins"][0], server["plugins"])
 
     def test_reinstallation_is_byte_identical_and_creates_no_new_backup(self):
         self.run_installer("--apply")
@@ -74,16 +90,16 @@ class OpenCodeInstallTests(unittest.TestCase):
         old = self.plugin
         self.plugin = self.ready_plugin("release-two")
         self.run_installer("--apply")
-        plugins = json.loads(self.server_path.read_text())["plugins"]
+        plugins = json.loads(self.cli_path.read_text())["plugins"]
         self.assertIn({"package": str(self.plugin), "options": {"refreshIntervalMs": 5000}}, plugins)
         self.assertFalse(any((p.get("package") if isinstance(p, dict) else p) == str(old) for p in plugins))
 
     def test_upgrade_replaces_an_escaped_file_url_and_preserves_its_options(self):
         old = self.ready_plugin("release with spaces")
-        self.server["plugins"][1]["package"] = old.as_uri()
-        self.server_path.write_text(json.dumps(self.server))
+        self.cli["plugins"][1]["package"] = old.as_uri()
+        self.cli_path.write_text(json.dumps(self.cli))
         self.run_installer("--apply")
-        plugins = json.loads(self.server_path.read_text())["plugins"]
+        plugins = json.loads(self.cli_path.read_text())["plugins"]
         self.assertIn({"package": str(self.plugin), "options": {"refreshIntervalMs": 5000}}, plugins)
         self.assertFalse(any((p.get("package") if isinstance(p, dict) else p) == old.as_uri() for p in plugins))
 
@@ -101,33 +117,20 @@ class OpenCodeInstallTests(unittest.TestCase):
             self.assertEqual(directives[-1], "-" + reporter)
         self.assertEqual(self.run_installer("--apply")["changedFiles"], [])
 
-    def test_missing_dependencies_cannot_expose_an_unloadable_plugin(self):
-        (self.plugin / "node_modules/@opencode/client/package.json").unlink()
+    def test_an_incomplete_plugin_directory_cannot_be_registered(self):
+        (self.plugin / "herdr.mjs").unlink()
         before = self.server_path.read_bytes()
         self.run_installer("--apply", ok=False)
         self.assertEqual(self.server_path.read_bytes(), before)
         self.assertFalse((self.config / "task-lifecycle-backups").exists())
 
-    def test_unknown_bridge_fails_before_configuration_changes(self):
+    def test_unrelated_plugin_files_are_never_touched(self):
         bridge = self.config / "plugins/claude-code-hooks.js"
         bridge.parent.mkdir()
         bridge.write_text("// Unfamiliar user work\nexport default {};\n")
-        before = {p: p.read_bytes() for p in (self.server_path, self.cli_path, bridge)}
-        self.run_installer("--apply", ok=False)
-        self.assertEqual({p: p.read_bytes() for p in before}, before)
-
-    def test_known_bridge_is_patched_once_and_other_content_survives(self):
-        bridge = self.config / "plugins/claude-code-hooks.js"
-        bridge.parent.mkdir()
-        bridge.write_text((ROOT / "tests/fixtures/legacy-bridge.js").read_text() + "\n// preserved user addition\n")
+        before = bridge.read_bytes()
         self.run_installer("--apply")
-        first = bridge.read_bytes()
-        second = self.run_installer("--apply")
-        self.assertEqual(bridge.read_bytes(), first)
-        self.assertEqual(second["changedFiles"], [])
-        self.assertTrue(first.endswith(b"// preserved user addition\n"))
-        entry = next(p for p in json.loads(self.server_path.read_text())["plugins"] if isinstance(p, dict) and p["package"].endswith("claude-code-hooks.js"))
-        self.assertIs(entry["options"]["notifications"], False)
+        self.assertEqual(bridge.read_bytes(), before)
 
     def test_restore_recovers_original_bytes_and_modes(self):
         self.server_path.chmod(0o640)

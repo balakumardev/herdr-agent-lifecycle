@@ -54,8 +54,8 @@ def verify(dist, version):
         packed = root / "npm-install"
         run(["npm", "install", "--prefix", str(packed), str(dist / package_name), *npm], cwd=root, env=env)
         run(["node", "--input-type=module", "-e",
-             "import server from 'opencode-herdr-lifecycle'; import tui from 'opencode-herdr-lifecycle/tui';"
-             "if(server.id !== 'local.task-lifecycle' || tui.id !== 'local.task-lifecycle.tui') process.exit(1);"],
+             "import tui from 'opencode-herdr-lifecycle/tui';"
+             "if(tui.id !== 'local.task-lifecycle.tui') process.exit(1);"],
             cwd=packed, env=env)
         config = home / ".config/opencode"
         config.mkdir(parents=True)
@@ -66,28 +66,26 @@ def verify(dist, version):
         assert json.loads(run([*command, "--apply"], cwd=root, env=env))["changedFiles"] == []
         server = json.loads((config / "opencode.json").read_text())
         terminal = json.loads((config / "cli.json").read_text())
-        assert "existing-plugin" in server["plugins"] and str(source / "opencode") in server["plugins"]
-        assert server["plugins"][-1] == "-herdr.opencode.agent-state"
-        assert terminal["plugins"][-1] == "-herdr.opencode.session-selection"
+        assert server["plugins"] == ["existing-plugin", "-herdr.opencode.agent-state"]
+        assert terminal["plugins"] == [str(source / "opencode"), "-herdr.opencode.session-selection"]
         run([sys.executable, str(source / "scripts/install-opencode.py"), "--restore",
              installed["backupDirectory"], "--apply"], cwd=root, env=env)
         assert (config / "opencode.json").read_text() == original
         assert not (config / "cli.json").exists()
-        command = [sys.executable, str(source / "claude/install.py"), "--home", str(home)]
-        installed = json.loads(run([*command, "--apply"], cwd=root, env=env))
-        assert json.loads(run([*command, "--apply"], cwd=root, env=env))["changed_files"] == 0
-        staged = home / ".claude/hooks/task-lifecycle"
-        run([sys.executable, "-B", "-c",
-             "from runtime import Runtime; from configuration import load_config; "
-             "assert load_config()['claude']['allowIdleTeammates'] is False"], cwd=staged, env=env)
-        manifest = json.loads((staged / ".claude-plugin/plugin.json").read_text())
+        # The Claude plugin ships as plain files; the extracted hook must run silently outside a Herdr pane.
+        plugin = source / "claude"
+        manifest = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
         assert manifest["version"] == version
-        run([*command, "--restore", installed["backup_directory"], "--apply"], cwd=root, env=env)
-        assert not (staged / "runtime.py").exists()
+        hooks = json.loads((plugin / "hooks/hooks.json").read_text())["hooks"]
+        assert {"Stop", "UserPromptSubmit", "PermissionRequest"} <= set(hooks)
+        stdin = json.dumps({"hook_event_name": "Stop", "background_tasks": [{"type": "shell", "status": "running"}]})
+        silent = subprocess.run([sys.executable, "-B", str(plugin / "background_work.py")], input=stdin, text=True,
+                                capture_output=True, env=env, cwd=root, timeout=30)
+        assert (silent.returncode, silent.stdout, silent.stderr) == (0, "", "")
         output = run(["npm", "run", "test:runtime"], cwd=source, env=env)
         print(output)
     print(json.dumps({"version": version, "sourceRuntimeTests": "passed", "npmEntrypoints": "passed",
-                      "cleanHomeInstallAndRestore": ["opencode", "claude"]}))
+                      "cleanHomeInstallAndRestore": ["opencode"], "claudeHook": "passed"}))
 
 
 if __name__ == "__main__":

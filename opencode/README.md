@@ -1,95 +1,73 @@
-# OpenCode V2 task lifecycle integration
+# OpenCode background-work overlay for Herdr
 
-Native V2 session-tree state for Herdr and optional ntfy on macOS and Linux.
+Herdr reads the screen to decide whether an agent is working, and says **Done**
+while OpenCode still has subagents or background shells running. This TUI
+plugin corrects exactly that and nothing else.
 
 ## Behavior
 
-- **Working:** the root or any descendant is running, an inbox has queued work, an owned shell is running, or a descendant has finished but the parent has not yet produced its final response.
-- **Blocked:** a user form or permission is pending, or root execution failed/interrupted. Only pending user forms produce blocked **ntfy** alerts.
-- **Done / Idle:** a successful root execution has a completed, final (`stop`) assistant response after its descendants settled, with no pending work. Herdr receives `idle` and shows **Done** while the completion is unread, then **Idle** after it is viewed; ntfy receives one completion notification. Refreshing the same result preserves its read/unread status.
-- **Unknown:** the first snapshot could not be read, or a failed refresh made an earlier Idle report untrustworthy. The custom reporter claims the pane and retries, so screen detection cannot mistake invisible background work for completion. A confirmed Working or Blocked report is retained only when no later status delivery made that confirmation uncertain. New lifecycle events cannot suppress Unknown; navigation and disposal still prevent obsolete reports.
-- Lifecycle changes with known ownership and location invalidate their own task tree and tasks depending on a shared runtime directory, including newly created children and background-shell cleanup. Reconnection or unresolved ancestry/location still invalidates all potentially affected reads. `reason: refreshing` means the read is unavailable, not that an execution started. Its legacy wire value remains `state: working` because older location RPC registrations survive a shared-monitor upgrade. The TUI checks the reason first and retries without changing an established Herdr state. An independent `requestTimeoutMs` freshness deadline (5 seconds by default) bounds that grace period, even when events keep invalidating replies or retries are slower. Missing initial confidence or an expired deadline reports Unknown. This avoids both reannouncing read completions and erasing unread ones during a brief refresh.
-- The completion body is the text of that newest root assistant response, read by the existing root-only `message.list` query (`type: assistant`, descending, limit 1). Reasoning and tool parts are excluded; older answers and child messages are never substitutes. Multiple text parts are separated by blank lines. Bodies over 4000 UTF-8 bytes are truncated at a code-point boundary with `…` included in that budget.
-- If the final body is missing or unreadable, completion stays unconfirmed and is retried through normal reconciliation. There is no boilerplate fallback. Message text goes only to the notifier, never to the public snapshot RPC, snapshot cache, or persistent receipts/deduplication records.
-- Opening an already completed session does not replay historical completion alerts.
-- Descendants can live in different directories/worktrees. The pane remains attributed to its root.
-- Completed children remain part of the task after their temporary worktrees are removed. Persisted history and queued input are read for every child; forms, permissions and shells are read only from locations in OpenCode's runtime registry.
-- A registry entry can still be starting up. Failed runtime reads are reconciled only after all issued reads settle and a fresh registry read proves the location is absent. Any successful runtime read, active conversation sharing that directory, or unresolved owned command prevents exclusion. Registry/activity checks run again after the remaining reads; uncertainty prevents completion and triggers a fresh snapshot.
+Herdr's own detection stays in charge of everything it gets right (a turn
+running, a question or permission on screen, idle). The plugin takes over the
+pane only while the selected session's family (the root plus every descendant)
+has background work:
 
-### Delivery retries
+| Situation | Reported to Herdr |
+| --- | --- |
+| A descendant session is running, or a running shell is owned by any session in the family | `working` |
+| ...and a family session has a pending question or permission | `blocked` |
+| Anything else, a read failure, the route leaving a session, or the plugin being disposed | authority cleared, so Herdr's detection decides |
 
-Each admission makes at most one HTTP request. Failed transient requests back off exponentially (30 seconds up to 15 minutes, plus up to 20% jitter). HTTP 429 waits at least 60 seconds. `Retry-After` seconds and HTTP dates are honored when they require a longer wait. A persisted endpoint-wide cooldown covers all sessions in this integration, including concurrent publishers and newly created notifier instances. Non-retryable HTTP errors are recorded as terminal failures for that notice, never as successful deliveries.
+It never reports `idle` or `unknown`, never sends resume or session data, and
+never notifies. A hold is confirmed by a live `session.active()` /
+`shell.list()` read before it is reported, so a missed event cannot leave the
+pane stuck on Working; any failed or timed-out read clears it instead.
 
-The monitor re-reads lifecycle state before eligible retries; new work or an answered question revokes the old alert. Notification HTTP work runs independently of status reads. Cooldown checks create neither HTTP traffic nor receipt rows. Receipt rows for failed attempts include `retryAt` (Unix milliseconds) or `terminal:true`; backoff state contains metadata only. These rules correct the initial rapid retry loop that kept starting fresh three-request batches during an outage.
+Shells are per directory, so every directory used by a family member is read.
 
-Claim-numbered retry records keep expired publishers from overwriting newer cooldowns. A received HTTP success remains acknowledged even if its claim expired while the process was suspended. If saving a server deadline fails, a process-wide guard retains it and repairs the durable checkpoint when storage becomes writable.
+Not supported on purpose: notifications (ntfy), resume or session reporting, and
+any Done/Idle authority. If you want those, they are not in this package.
 
-## Components
+## How it is registered
 
-- `lifecycle.mjs`: bounded, paginated reads of the public V2 API; shared classification.
-- `monitor.mjs`: event invalidation, snapshot reconciliation, and notification admission.
-- `index.js`: one authenticated monitor per OpenCode service process, shared across location instances; exposes `local.task-lifecycle/snapshot` RPC.
-- `tui.js` / `herdr.mjs`: selected-root reporting using the terminal's own Herdr pane environment.
-- `config.mjs`: the shared public configuration schema.
-- `notify.mjs`: bounded HTTP delivery, persistent concurrent deduplication, and sanitized receipts.
-
-The service is discovered through `@opencode/client/service`. Discovery never launches a service. Its PID must match the plugin host, so a standalone server cannot accidentally report another shared server's sessions.
-
-## Configuration
-
-Effective server configuration: `~/.config/opencode/opencode.json` (or the
-`opencode/` directory under `$XDG_CONFIG_HOME`). Use the [installer](../README.md#opencode)
-to merge a dependency-complete release. Its resulting plugin entries are:
+The package exposes only `./tui`. Register the directory in `cli.json`
+(`~/.config/opencode/cli.json`), and keep Herdr's own OpenCode reporters off
+because they conflict with it:
 
 ```json
-{
-  "plugins": [
-    "-herdr.opencode.agent-state",
-    "/absolute/release/path/opencode"
-  ]
-}
+{ "plugins": ["/absolute/path/to/opencode", "-herdr.opencode.session-selection"] }
 ```
 
-These entries are merged with existing plugins. If a recognized legacy Claude
-notification bridge is present, the installer transfers its notification role
-to this integration while retaining its audit/context/lint behavior.
+and in `opencode.json`: `{ "plugins": ["-herdr.opencode.agent-state"] }`.
 
-Terminal configuration is `~/.config/opencode/cli.json`, with
-`"-herdr.opencode.session-selection"` and the same absolute plugin directory in
-`plugins`. The custom Herdr agent label is `opencode-v2`; the resume executable
-defaults to `opencode` and is configurable through `opencode.command` in the
-[shared settings file](../README.md#configuration).
+`scripts/install-opencode.py --config-dir ~/.config/opencode` does this merge
+(dry run by default, `--apply` to write, `--restore BACKUP --apply` to undo with
+later-edit protection). It also removes an older server-side registration of
+this plugin, which no longer has a server entry point. No `npm ci` is needed:
+the package has no dependencies.
+
+Only Herdr panes are affected: it does nothing unless `HERDR_ENV=1`,
+`HERDR_PANE_ID` and `HERDR_SOCKET_PATH` are set.
 
 ## Diagnostics
 
 ```bash
-opencode api post '/api/rpc/local.task-lifecycle/health' --data '{"input":{}}'
-opencode api post '/api/rpc/local.task-lifecycle/snapshot' \
-  --data '{"input":{"sessionID":"<sessionID>"}}'
-herdr agent get '<paneID>'
+herdr agent get <paneID>        # status as Herdr currently reports it
+herdr agent explain <paneID>    # what the screen detector sees
 ```
 
-Notifications use the shared settings file and are disabled by default. Receipts
-are at `$XDG_STATE_HOME/opencode/task-lifecycle/receipts.jsonl` (normally
-`~/.local/state/opencode/task-lifecycle/receipts.jsonl`). They contain hashed event
-keys, HTTP status and delivery outcome. HTTP acceptance verifies publication;
-device alerts also depend on the subscribing app.
+While a hold is active the pane's status is `working` (or `blocked`) even if the
+screen looks idle. The reports use source `custom:opencode-background-work` and
+agent `opencode`, matching the label Herdr detects.
 
-The `local.task-lifecycle/health` RPC returns the loaded version/build revision,
-monitor readiness and location reference count. A receipt with `retryAt` means
-delivery is waiting. Terminal failures (such as HTTP 401/403) require correcting
-the endpoint/auth problem; future notices use new keys.
+The pane is handed back with `pane.clear_agent_authority`, not
+`pane.release_agent`: on Herdr 0.9.3 the latter drops the agent identity and
+leaves the pane `unknown` for about 3 seconds while it is re-detected. A Herdr
+that does not know the method answers `invalid_request` (checked on 0.9.3, whose
+error lists the supported methods), and the plugin then switches to
+`pane.release_agent` for the rest of that process.
 
 ## Verification
 
-Run `npm test` from the repository root. Tests use temporary Unix sockets and
-local HTTP servers, including the packaged legacy-bridge fixture.
-
-## Applying source updates on the shared service
-
-[V2 plugin configuration](https://opencode.ai/v2/docs/plugins#reload) supports automatic reloads for watched configuration directories. This package keeps its monitor in a process-global, reference-counted singleton (`index.js`). Upgrades use a versioned handoff: the first setup from a newer build aborts the old event subscription, replaces the monitor and retains pending observation metadata and retry deadlines. Old in-flight admissions are invalidated. Other location references keep using the replacement.
-
-After updating source, trigger a watched plugin-config reload and verify `local.task-lifecycle/health` reports the new version, then check a real diagnostic completion. Editing an unwatched imported file alone is not proof of activation. If a restart is used instead, schedule it after active work finishes. Startup hydration continues to suppress historical completion alerts.
-
-The installer prints a private backup directory and supports guarded
-`--restore BACKUP --apply`. See [upgrade and rollback](../README.md#upgrade-and-rollback).
+`npm test` in this directory runs the unit tests against a fake Herdr socket and
+fake OpenCode objects. Run it outside a Herdr pane, or with `HERDR_ENV`,
+`HERDR_PANE_ID` and `HERDR_SOCKET_PATH` unset.

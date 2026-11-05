@@ -1,208 +1,153 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import net from "node:net";
-import { join } from "node:path";
 import { test } from "node:test";
-import { createHerdrReporter } from "./herdr.mjs";
+import { createHerdr } from "./herdr.mjs";
+import { quiet, socketFixture } from "./fixtures.mjs";
 
-const working = { rootID: "ses_root", state: "working", reason: "child-active" };
+test("is disabled outside a Herdr pane", () => {
+  const env = { HERDR_ENV: "1", HERDR_PANE_ID: "pane-one", HERDR_SOCKET_PATH: "/unused" };
+  assert.equal(createHerdr({}), undefined);
+  assert.equal(createHerdr({ ...env, HERDR_ENV: "0" }), undefined);
+  assert.equal(createHerdr({ ...env, HERDR_PANE_ID: "" }), undefined);
+  assert.equal(createHerdr({ ...env, HERDR_SOCKET_PATH: undefined }), undefined);
+});
 
-async function socketFixture(t, reply = (request, socket) => {
-  socket.end(`${JSON.stringify({ id: request.id, result: { type: "ok" } })}\n`);
-}) {
-  const directory = await mkdtemp(join(tmpdir(), "lifecycle-herdr-"));
-  const path = join(directory, "s");
-  const requests = [];
-  const sockets = new Set();
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.on("error", () => {});
-    socket.on("close", () => sockets.delete(socket));
-    let buffer = "";
-    socket.on("data", (chunk) => {
-      buffer += chunk;
-      if (!buffer.includes("\n")) return;
-      const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
-      requests.push(request);
-      reply(request, socket);
-    });
-  });
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(path, resolve);
-  });
-  t.after(async () => {
-    for (const socket of sockets) socket.destroy();
-    await new Promise((resolve) => server.close(resolve));
-    await rm(directory, { recursive: true, force: true });
-  });
-  return { requests, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: path, HERDR_PANE_ID: "pane-one" } };
-}
-
-function reporter(t, env, options) {
-  const client = createHerdrReporter(env, options);
-  t.after(() => client.dispose());
-  return client;
-}
-
-test("reports the root identity and resumable V2 command on the pane captured at setup", async (t) => {
+test("hold reports the state for the opencode label under the overlay source, with no session data", async (t) => {
   const { requests, env } = await socketFixture(t);
-  const client = reporter(t, env);
-  env.HERDR_PANE_ID = "wrong-pane";
-  env.HERDR_SOCKET_PATH = "/not-the-captured-socket";
-  assert.equal(await client.report(working), true);
+  const herdr = createHerdr(env);
+  assert.equal(await herdr.hold("working", "background work running"), true);
   assert.equal(requests.length, 1);
-  const { id, method, params: { seq, ...params } } = requests[0];
+  const { id, method, params } = requests[0];
   assert.equal(typeof id, "string");
   assert.equal(method, "pane.report_agent");
-  assert.ok(Number.isSafeInteger(seq));
-  assert.deepEqual(params, {
-    pane_id: "pane-one",
-    source: "custom:opencode-v2-lifecycle",
-    agent: "opencode-v2",
-    state: "working",
-    agent_session_id: "ses_root",
-    resume_argv: ["opencode", "--session", "ses_root"],
-    message: "child-active",
+  assert.ok(Number.isSafeInteger(params.seq));
+  assert.deepEqual({ ...params, seq: undefined }, {
+    pane_id: "pane-one", source: "custom:opencode-background-work", agent: "opencode",
+    seq: undefined, state: "working", message: "background work running",
   });
 });
 
-test("skips reporting outside a fully identified Herdr pane", async (t) => {
+test("release clears only this source's authority, without dropping Herdr's agent identity", async (t) => {
   const { requests, env } = await socketFixture(t);
-  for (const field of ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"]) {
-    const client = reporter(t, { ...env, [field]: "" });
-    assert.equal(client.enabled, false);
-    assert.equal(await client.report(working), false);
-  }
-  assert.equal(requests.length, 0);
+  const herdr = createHerdr(env);
+  assert.equal(await herdr.release(), true);
+  const { method, params } = requests[0];
+  assert.equal(method, "pane.clear_agent_authority");
+  assert.deepEqual({ ...params, seq: undefined }, {
+    pane_id: "pane-one", source: "custom:opencode-background-work", seq: undefined,
+  });
 });
 
-test("a configured executable is reported as one argv entry without shell interpretation", async (t) => {
+test("clearLegacy clears only release 1.0.3's source", async (t) => {
   const { requests, env } = await socketFixture(t);
-  const client = reporter(t, env, { command: "/Applications/OpenCode CLI/opencode" });
-  assert.equal(await client.report(working), true);
-  assert.deepEqual(requests[0].params.resume_argv, ["/Applications/OpenCode CLI/opencode", "--session", "ses_root"]);
+  assert.equal(await createHerdr(env).clearLegacy(), true);
+  const { method, params } = requests[0];
+  assert.equal(method, "pane.clear_agent_authority");
+  assert.deepEqual({ ...params, seq: undefined }, {
+    pane_id: "pane-one", source: "custom:opencode-v2-lifecycle", seq: undefined,
+  });
 });
 
-test("coalesces acknowledged identical states but orders changed roots and states", async (t) => {
+test("seq strictly increases across calls and across instances", async (t) => {
   const { requests, env } = await socketFixture(t);
-  const client = reporter(t, env);
-  await Promise.all([client.report(working), client.report(working), client.report(working)]);
-  await client.report({ ...working, state: "blocked", reason: "question" });
-  await client.report({ ...working, rootID: "ses_other" });
-  assert.deepEqual(requests.map(({ params }) => [params.agent_session_id, params.state]), [
-    ["ses_root", "working"], ["ses_root", "blocked"], ["ses_other", "working"],
-  ]);
-  assert.ok(requests[0].params.seq < requests[1].params.seq);
-  assert.ok(requests[1].params.seq < requests[2].params.seq);
-  assert.equal(new Set(requests.map((request) => request.id)).size, 3);
+  const first = createHerdr(env);
+  await first.hold("working", "a");
+  await first.release();
+  const second = createHerdr(env);
+  await second.hold("blocked", "b");
+  await second.release();
+  const seqs = requests.map((request) => request.params.seq);
+  assert.equal(seqs.length, 4);
+  for (let i = 1; i < seqs.length; i++) assert.ok(seqs[i] > seqs[i - 1], `seq ${seqs[i]} must exceed ${seqs[i - 1]}`);
 });
 
-test("a JSON error reply is a failed delivery and the same state is retried", async (t) => {
-  let attempt = 0;
-  const { requests, env } = await socketFixture(t, (request, socket) => {
-    socket.end(`${JSON.stringify(++attempt === 1
-      ? { id: request.id, error: { code: "invalid_params", message: "rejected" } }
-      : { id: request.id, result: { type: "ok" } })}\n`);
-  });
-  const client = reporter(t, env);
-  assert.equal(await client.report(working), false);
-  assert.equal(await client.report(working), true);
-  assert.equal(requests.length, 2);
-  assert.ok(requests[1].params.seq > requests[0].params.seq);
+test("a delivery failure resolves false instead of throwing", async (t) => {
+  const refused = await socketFixture(t, (request, socket) => socket.end(`${JSON.stringify({ id: request.id, error: "no" })}\n`));
+  assert.equal(await createHerdr(refused.env).hold("working", "x"), false);
+  const wrongId = await socketFixture(t, (request, socket) => socket.end(`${JSON.stringify({ id: "other", result: { type: "ok" } })}\n`));
+  assert.equal(await createHerdr(wrongId.env).hold("working", "x"), false);
+  const garbage = await socketFixture(t, (request, socket) => socket.end("not json\n"));
+  assert.equal(await createHerdr(garbage.env).hold("working", "x"), false);
+  const missing = createHerdr({ HERDR_ENV: "1", HERDR_PANE_ID: "p", HERDR_SOCKET_PATH: "/nonexistent/herdr.sock" });
+  assert.equal(await missing.hold("working", "x"), false);
 });
 
-test("an uncertain delivery invalidates the prior acknowledgement before state reverses", async (t) => {
-  let attempt = 0;
-  const { requests, env } = await socketFixture(t, (request, socket) => {
-    // The report can have reached Herdr even if its acknowledgement is lost.
-    if (++attempt === 2) return socket.end();
-    socket.end(`${JSON.stringify({ id: request.id, result: { type: "ok" } })}\n`);
-  });
-  const client = reporter(t, env);
-  assert.equal(await client.report(working), true);
-  assert.equal(await client.report({ ...working, state: "blocked" }), false);
-  assert.equal(await client.report(working), true);
-  assert.deepEqual(requests.map(({ params }) => params.state), ["working", "blocked", "working"]);
-});
-
-test("waits for a complete newline-framed acknowledgement across chunks", async (t) => {
-  const { env } = await socketFixture(t, (request, socket) => {
-    const ack = JSON.stringify({ id: request.id, result: { type: "ok" } });
-    socket.write(ack.slice(0, 7));
-    setImmediate(() => socket.end(`${ack.slice(7)}\n`));
-  });
-  assert.equal(await reporter(t, env).report(working), true);
-});
-
-for (const [name, reply] of [
-  ["malformed JSON", (_request, socket) => socket.end("not-json\n")],
-  ["a mismatched request id", (_request, socket) => socket.end('{"id":"other","result":{"type":"ok"}}\n')],
-  ["a missing success result", (request, socket) => socket.end(`${JSON.stringify({ id: request.id })}\n`)],
-  ["an unrelated result", (request, socket) => socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane" } })}\n`)],
-  ["an early disconnect", (_request, socket) => socket.end()],
-  ["an oversized reply", (_request, socket) => socket.end("x".repeat(70_000))],
-]) {
-  test(`does not acknowledge ${name}`, async (t) => {
-    const { env } = await socketFixture(t, reply);
-    assert.equal(await reporter(t, env).report(working), false);
-  });
-}
-
-test("bounds a connected socket that never acknowledges", async (t) => {
+test("a server that never answers is abandoned after the timeout", async (t) => {
   const { env } = await socketFixture(t, () => {});
   const started = Date.now();
-  assert.equal(await reporter(t, env, { timeoutMs: 40 }).report(working), false);
-  assert.ok(Date.now() - started < 500);
+  assert.equal(await createHerdr(env, { timeoutMs: 80 }).hold("working", "x"), false);
+  assert.ok(Date.now() - started < 1_000);
 });
 
-test("a missing socket is a failed delivery rather than a cached success", async (t) => {
-  const { env } = await socketFixture(t);
-  const client = reporter(t, { ...env, HERDR_SOCKET_PATH: `${env.HERDR_SOCKET_PATH}-missing` });
-  assert.equal(await client.report(working), false);
-  assert.equal(await client.report(working), false);
+test("requests are serialized: a release queued behind a slow hold arrives after it", async (t) => {
+  const { requests, env } = await socketFixture(t, (request, socket) => {
+    const answer = () => socket.end(`${JSON.stringify({ id: request.id, result: { type: "ok" } })}\n`);
+    if (request.method === "pane.report_agent") setTimeout(answer, 80); else answer();
+  });
+  const herdr = createHerdr(env);
+  const hold = herdr.hold("working", "x");
+  const release = herdr.release();
+  await quiet(30);
+  assert.deepEqual(requests.map((request) => request.method), ["pane.report_agent"]);
+  assert.deepEqual(await Promise.all([hold, release]), [true, true]);
+  assert.deepEqual(requests.map((request) => request.method), ["pane.report_agent", "pane.clear_agent_authority"]);
 });
 
-test("independent pane reporters retain their own identities", async (t) => {
+test("a superseded instance sends nothing, so a hot-reloaded predecessor cannot clear its successor", async (t) => {
   const { requests, env } = await socketFixture(t);
-  const first = reporter(t, env);
-  const second = reporter(t, { ...env, HERDR_PANE_ID: "pane-two" });
-  await Promise.all([first.report(working), second.report({ ...working, rootID: "ses_two" })]);
-  assert.deepEqual(requests.map(({ params }) => [params.pane_id, params.agent_session_id]).sort(), [
-    ["pane-one", "ses_root"], ["pane-two", "ses_two"],
-  ]);
-});
-
-test("aborted selections and disposed reporters cannot deliver queued reports", async (t) => {
-  let received;
-  const arrival = new Promise((resolve) => { received = resolve; });
-  const { requests, env } = await socketFixture(t, received);
-  const client = reporter(t, env);
-  const controller = new AbortController();
-  const first = client.report(working, { signal: controller.signal });
-  await arrival;
-  const queued = client.report({ ...working, state: "idle" });
-  controller.abort();
-  client.dispose();
-  assert.deepEqual(await Promise.all([first, queued]), [false, false]);
-  assert.equal(await client.report(working), false);
+  const old = createHerdr(env);
+  const current = createHerdr(env);
+  assert.equal(await old.release(), false);
+  assert.equal(await old.hold("working", "x"), false);
+  assert.equal(requests.length, 0);
+  assert.equal(await current.hold("working", "x"), true);
   assert.equal(requests.length, 1);
 });
 
-test("a replacement reporter fences old reports and old cleanup never releases its authority", async (t) => {
-  const { requests, env } = await socketFixture(t);
-  const old = reporter(t, env);
-  await old.report(working);
-  const next = reporter(t, env);
-  await next.report({ ...working, rootID: "ses_replacement" });
-  old.dispose();
-  assert.equal(await old.report({ ...working, state: "idle" }), false);
-  await next.report({ ...working, rootID: "ses_replacement", state: "blocked" });
-  assert.deepEqual(requests.map(({ method, params }) => [method, params.agent_session_id, params.state]), [
-    ["pane.report_agent", "ses_root", "working"],
-    ["pane.report_agent", "ses_replacement", "working"],
-    ["pane.report_agent", "ses_replacement", "blocked"],
-  ]);
-  assert.ok(requests[2].params.seq > requests[1].params.seq);
+const answer = (request, socket, error) => socket.end(`${JSON.stringify(error
+  ? { id: request.id, error: { code: error, message: error } } : { id: request.id, result: { type: "ok" } })}\n`);
+// A Herdr that does not know clear_agent_authority, like an older or newer release might not.
+const withoutClear = (request, socket) => answer(request, socket, request.method === "pane.clear_agent_authority" ? "invalid_request" : undefined);
+
+test("falls back to release_agent when Herdr rejects clear_agent_authority, and stays on it", async (t) => {
+  const { requests, env } = await socketFixture(t, withoutClear);
+  const herdr = createHerdr(env);
+  assert.equal(await herdr.release(), true);
+  assert.deepEqual(requests.map((request) => request.method), ["pane.clear_agent_authority", "pane.release_agent"]);
+  const { params } = requests[1];
+  assert.deepEqual({ ...params, seq: undefined }, {
+    pane_id: "pane-one", source: "custom:opencode-background-work", agent: "opencode", seq: undefined,
+  });
+  assert.ok(params.seq > requests[0].params.seq, "each attempt carries a fresh seq");
+  requests.length = 0;
+  assert.equal(await herdr.release(), true);
+  assert.deepEqual(requests.map((request) => request.method), ["pane.release_agent"], "the unsupported method is not retried");
+  assert.equal(await herdr.hold("working", "x"), true, "holding is unaffected");
 });
-import { tmpdir } from 'node:os';
+
+test("the legacy clear falls back with the legacy agent label", async (t) => {
+  const { requests, env } = await socketFixture(t, withoutClear);
+  assert.equal(await createHerdr(env).clearLegacy(), true);
+  assert.deepEqual(requests.map((request) => request.method), ["pane.clear_agent_authority", "pane.release_agent"]);
+  assert.deepEqual({ ...requests[1].params, seq: undefined }, {
+    pane_id: "pane-one", source: "custom:opencode-v2-lifecycle", agent: "opencode-v2", seq: undefined,
+  });
+});
+
+test("a failed fallback reports false instead of throwing", async (t) => {
+  const { requests, env } = await socketFixture(t, (request, socket) => answer(request, socket, "invalid_request"));
+  assert.equal(await createHerdr(env).release(), false);
+  assert.deepEqual(requests.map((request) => request.method), ["pane.clear_agent_authority", "pane.release_agent"]);
+});
+
+test("only an unknown-method style rejection switches methods; other failures keep clear_agent_authority", async (t) => {
+  const missing = await socketFixture(t, (request, socket) => answer(request, socket, "pane_not_found"));
+  const herdr = createHerdr(missing.env);
+  assert.equal(await herdr.release(), false);
+  assert.equal(await herdr.release(), false);
+  assert.deepEqual(missing.requests.map((request) => request.method), ["pane.clear_agent_authority", "pane.clear_agent_authority"]);
+  const silent = await socketFixture(t, () => {});
+  const timedOut = createHerdr(silent.env, { timeoutMs: 60 });
+  assert.equal(await timedOut.release(), false);
+  assert.equal(await timedOut.release(), false);
+  assert.deepEqual(silent.requests.map((request) => request.method), ["pane.clear_agent_authority", "pane.clear_agent_authority"]);
+});

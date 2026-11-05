@@ -3,7 +3,7 @@
   "version": "1.0.3",
   "private": true,
   "type": "module",
-  "description": "Task-aware Herdr completion reporting for Claude Code and OpenCode",
+  "description": "Keeps Herdr showing Working while a Claude Code or OpenCode agent has subagents or background shells running",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -17,7 +17,7 @@
     "test:runtime": "python3 scripts/test.py --runtime-only",
     "test:opencode": "npm test --prefix opencode",
     "test:claude": "python3 -m unittest discover -s claude/tests -p 'test_*.py'",
-    "test:native": "claude plugin validate claude && claude plugin test claude",
+    "test:native": "claude plugin validate claude",
     "release": "semantic-release"
   },
   "devDependencies": {

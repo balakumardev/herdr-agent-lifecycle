@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Register a prepared OpenCode lifecycle release without restarting the service."""
+"""Register the OpenCode background-work overlay plugin without restarting the service."""
 import argparse
 import hashlib
 import json
@@ -59,22 +59,6 @@ def read_config(path):
     return result
 
 
-def patch_bridge(text):
-    replacements = [
-        ("async function v1({ client, directory }) {", "async function v1({ client, directory, notifications = true }) {"),
-        ("  async function attention(event, sessionID) {\n", "  async function attention(event, sessionID) {\n    if (!notifications) return;\n"),
-        ("const bridge = await v1({ client: v1Client, directory });",
-         "const bridge = await v1({ client: v1Client, directory, notifications: ctx.options?.notifications === true });"),
-    ]
-    for old, new in replacements:
-        if new in text:
-            continue
-        if text.count(old) != 1:
-            raise ValueError("The existing claude-code-hooks.js has a different layout; apply the three README edits manually")
-        text = text.replace(old, new, 1)
-    return text
-
-
 def is_owned(value, destination, plugin):
     if value in (str(plugin), "./integrations/task-lifecycle", "opencode-herdr-lifecycle"):
         return True
@@ -98,7 +82,7 @@ def is_owned(value, destination, plugin):
         return False
 
 
-def register(entries, destination, plugin, disabled):
+def register(entries, destination, plugin, disabled, enabled=True):
     result = []
     owned = False
     for item in entries:
@@ -106,45 +90,32 @@ def register(entries, destination, plugin, disabled):
         if package == disabled:
             continue
         if is_owned(package, destination, plugin):
-            if owned:
+            if enabled and owned:
                 raise ValueError("Multiple lifecycle registrations need a manual merge")
             owned = True
-            result.append({**item, "package": str(plugin)} if isinstance(item, dict) else str(plugin))
+            if enabled:
+                result.append({**item, "package": str(plugin)} if isinstance(item, dict) else str(plugin))
         else:
             result.append(item)
-    if not owned:
+    if enabled and not owned:
         result.append(str(plugin))
     result.append(disabled)
     return result
 
 
 def installation_plan(destination, plugin):
-    for relative in ("package.json", "index.js", "tui.js", "node_modules/@opencode/client/package.json"):
+    for relative in ("package.json", "tui.js", "herdr.mjs"):
         if not (plugin / relative).is_file():
-            raise ValueError("Plugin release is not ready; run npm ci in its opencode directory first")
+            raise ValueError("Plugin directory is incomplete: missing " + relative)
     config = destination / ("opencode.jsonc" if (destination / "opencode.jsonc").exists() else "opencode.json")
     cli = destination / "cli.json"
     settings, terminal = read_config(config), read_config(cli)
     settings.setdefault("$schema", "https://opencode.ai/config.json")
     terminal.setdefault("$schema", "https://opencode.ai/v2/cli.json")
-    settings.setdefault("plugins", [])
-    patched = {}
-    bridge_path = destination / "plugins/claude-code-hooks.js"
-    bridge = read_bytes(bridge_path)
-    if bridge is not None:
-        patched[bridge_path] = patch_bridge(bridge.decode()).encode()
-        for i, item in enumerate(settings["plugins"]):
-            package = item.get("package") if isinstance(item, dict) else item
-            if package.endswith("/claude-code-hooks.js"):
-                updated = dict(item) if isinstance(item, dict) else {"package": item}
-                updated["options"] = {**updated.get("options", {}), "notifications": False}
-                settings["plugins"][i] = updated
-                break
-        else:
-            settings["plugins"].append({"package": "./plugins/claude-code-hooks.js", "options": {"notifications": False}})
-    settings["plugins"] = register(settings["plugins"], destination, plugin, "-herdr.opencode.agent-state")
+    # The plugin is TUI-only: the server list only loses stale registrations and keeps the native reporter off.
+    settings["plugins"] = register(settings.get("plugins", []), destination, plugin, "-herdr.opencode.agent-state", enabled=False)
     terminal["plugins"] = register(terminal.get("plugins", []), destination, plugin, "-herdr.opencode.session-selection")
-    patched[config], patched[cli] = encoded(settings), encoded(terminal)
+    patched = {config: encoded(settings), cli: encoded(terminal)}
     changes = []
     for path, data in patched.items():
         if not path.resolve().is_relative_to(destination):
@@ -183,6 +154,7 @@ def restore_plan(backup):
     if manifest.get("version") != 1 or not backup.is_relative_to(destination / "task-lifecycle-backups"):
         raise ValueError("Invalid installation backup")
     changes = []
+    # Backups made by earlier releases may also cover the retired Claude-bridge patch.
     allowed = {"opencode.json", "opencode.jsonc", "cli.json", "plugins/claude-code-hooks.js"}
     for record in manifest["files"]:
         if record["path"] not in allowed:

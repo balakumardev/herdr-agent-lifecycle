@@ -51,8 +51,9 @@ class ReleaseRecoveryTests(unittest.TestCase):
         self.root = Path(self.tmp.name) / "checkout"
         self.root.mkdir()
         for name in ("package.json", "package-lock.json", "README.md", "LICENSE",
-                     "opencode/package.json", "opencode/package-lock.json", "opencode/index.js", "opencode/LICENSE",
-                     "claude/.claude-plugin/plugin.json", "claude/runtime.py", ".claude-plugin/marketplace.json",
+                     "opencode/package.json", "opencode/package-lock.json", "opencode/tui.js", "opencode/herdr.mjs",
+                     "opencode/LICENSE", "claude/.claude-plugin/plugin.json", "claude/background_work.py",
+                     ".claude-plugin/marketplace.json",
                      "scripts/prepare-release.py"):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)

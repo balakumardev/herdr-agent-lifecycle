@@ -1,223 +1,69 @@
-import { LifecycleRPC } from "./contract.mjs";
-import { createHerdrReporter } from "./herdr.mjs";
+import { createHerdr } from "./herdr.mjs";
 
-const EVENTS = new Set([
-  "session.created", "session.deleted", "session.forked", "session.moved", "session.renamed",
-  "session.execution.started", "session.execution.succeeded", "session.execution.interrupted", "session.execution.failed",
-  "session.inbox.enqueued", "session.inbox.delivered", "session.inbox.cancelled", "session.inbox.delivery.changed",
-  "session.shell.started", "session.shell.ended",
-  "shell.created", "shell.exited", "shell.deleted",
-  "permission.asked", "permission.replied", "form.created", "form.replied", "form.cancelled",
-  "server.connected", "location.shutdown",
-]);
+const POLL_MS = 1_000;
+const READ_MS = 2_000;
 
-function duration(value, fallback) {
-  return Number.isFinite(value) ? Math.max(20, Math.min(60_000, value)) : fallback;
+// Reports `working`/`blocked` only while the selected root's family has background work; undefined means
+// "let Herdr's screen detection decide". Never reports idle or unknown.
+async function desiredState(api) {
+  const route = api.ui.router.current();
+  if (route?.type !== "session") return;
+  const { session, shell } = api.data;
+  const root = session.root(route.sessionID);
+  const family = session.family(root);
+  const owned = new Set(family);
+  const locations = [...new Map(family.map((id) => session.get(id)?.location).filter(Boolean)
+    .map((location) => [location.directory, location])).values()];
+  const ownedRunning = (shells) => shells.some((item) => item.status === "running" && owned.has(item.metadata?.sessionID));
+  // The synchronous store is the free trigger; only a positive is confirmed by live reads below.
+  if (!family.some((id) => id !== root && session.status(id) === "running") &&
+      !locations.some((location) => ownedRunning(shell.list(location)))) return;
+  // A missed event must never leave the pane held, so a hold needs a live read to agree.
+  const request = { signal: AbortSignal.timeout(READ_MS) };
+  const [active, ...lists] = await Promise.all([api.client.session.active(request),
+    ...locations.map((location) => api.client.shell.list({ location }, request))]);
+  if (!Object.keys(active).some((id) => id !== root && owned.has(id)) && !lists.some((list) => ownedRunning(list.data))) return;
+  // Herdr 0.9.3 still re-detects a visible prompt while held; reporting it here keeps `blocked` right on any version.
+  return family.some((id) => session.permission.list(id)?.length || session.form.list(id)?.length) ? "blocked" : "working";
 }
 
-function validSnapshot(value) {
-  return value && typeof value.rootID === "string" && value.rootID.length > 0 &&
-    ["working", "blocked", "idle", "unknown"].includes(value.state) && typeof value.complete === "boolean" &&
-    typeof value.reason === "string" && typeof value.title === "string" &&
-    Number.isInteger(value.activeCount) && value.activeCount >= 0 &&
-    Number.isInteger(value.pendingCount) && value.pendingCount >= 0 &&
-    Array.isArray(value.questionIDs) && value.questionIDs.every((id) => typeof id === "string") &&
-    typeof value.location?.directory === "string" && value.location.directory.length > 0;
-}
-
-function requestSnapshot(api, selection, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const controller = new AbortController();
-    let settled = false;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      selection.controller.signal.removeEventListener("abort", abort);
-      if (error) reject(error);
-      else resolve(value);
-    };
-    const abort = () => {
-      controller.abort();
-      finish(new Error("Lifecycle snapshot cancelled or timed out"));
-    };
-    const timer = setTimeout(abort, timeoutMs);
-    timer.unref?.();
-    selection.controller.signal.addEventListener("abort", abort, { once: true });
-    if (selection.controller.signal.aborted) return abort();
-    try {
-      Promise.resolve(api.client.rpc(LifecycleRPC).snapshot({ sessionID: selection.sessionID }, {
-        location: selection.location,
-        signal: controller.signal,
-      })).then((value) => finish(undefined, value), (error) => finish(error));
-    } catch (error) {
-      finish(error);
-    }
-  });
-}
+// Herdr may have applied a report whose acknowledgement was lost, so after one the state is unknown, not "released".
+const UNSURE = Symbol("unsure");
+const MESSAGES = { working: "background work running", blocked: "waiting for input" };
 
 export default {
   id: "local.task-lifecycle.tui",
   setup(api) {
-    const reporter = createHerdrReporter();
-    if (!reporter.enabled) return;
-    const options = api.options ?? {};
-    const pollMs = duration(options.pollIntervalMs, 250);
-    const refreshMs = duration(options.refreshIntervalMs, 3_000);
-    const retryMs = duration(options.retryIntervalMs, 500);
-    const requestMs = duration(options.requestTimeoutMs, 5_000);
+    const herdr = createHerdr(process.env);
+    if (!herdr) return;
+    void herdr.clearLegacy(); // an upgraded pane may still be held `unknown` by release 1.0.3
+    let sent = UNSURE; // last acknowledged state; undefined = released. Unsure at start frees a pane an earlier instance held.
+    let busy = false;
     let disposed = false;
-    let selected;
 
-    function readSelection() {
+    async function tick() {
+      if (busy || disposed) return;
+      busy = true;
       try {
-        const route = api.ui.router.current();
-        if (route?.type !== "session" || typeof route.sessionID !== "string" || !route.sessionID) return;
-        const location = api.data.session.get(route.sessionID)?.location ?? api.location ?? api.data.location.default();
-        if (typeof location?.directory !== "string" || !location.directory) return;
-        return {
-          sessionID: route.sessionID,
-          location: { ...location },
-          key: JSON.stringify([route.sessionID, location.directory, location.workspaceID]),
-        };
-      } catch {
-        // Unhydrated UI data is unknown, never evidence of idle.
-        return;
-      }
-    }
-
-    function current(selection) {
-      return !disposed && selected === selection && !selection.controller.signal.aborted &&
-        readSelection()?.key === selection.key;
-    }
-
-    function retire(selection) {
-      if (!selection) return;
-      clearTimeout(selection.timer);
-      clearFreshness(selection);
-      selection.controller.abort();
-    }
-
-    function clearFreshness(selection) {
-      clearTimeout(selection.freshnessTimer);
-      selection.freshnessTimer = undefined;
-      selection.refreshing = undefined;
-    }
-
-    function deferSnapshot(selection, explicitRefreshing) {
-      if (!selection.refreshing) {
-        const token = selection.refreshing = {};
-        const isCurrent = () => current(selection) && selection.refreshing === token;
-        // This deadline must run independently of RPC/event/retry timing. A
-        // busy stream cannot keep an old result trusted by racing every reply.
-        selection.freshnessTimer = setTimeout(() => {
-          if (selection.refreshing !== token) return;
-          // Expiry remains true even if navigation temporarily fences delivery.
-          // Returning before the route poll must not revive that old confidence.
-          token.expired = true;
-          selection.freshnessTimer = undefined;
-          selection.confirmed = undefined;
-          if (!isCurrent()) return;
-          void reporter.report({ rootID: selection.rootID, state: "unknown", reason: "snapshot-unavailable" }, {
-            signal: selection.controller.signal, isCurrent,
-          }).catch(() => false);
-        }, requestMs);
-        selection.freshnessTimer.unref?.();
-      }
-      // Preserve bootstrap coalescing for a locally raced first reply. An
-      // explicit unavailable result or an uncertain prior delivery needs Unknown now.
-      if (!selection.confirmed && (selection.rootID || explicitRefreshing || selection.refreshing.expired)) {
-        throw new Error("Lifecycle snapshot is not current");
-      }
-    }
-
-    function schedule(selection, delay = 20) {
-      if (disposed || selected !== selection || selection.timer || selection.busy) return;
-      selection.timer = setTimeout(() => { void refresh(selection); }, delay);
-      selection.timer.unref?.();
-    }
-
-    function syncSelection() {
-      if (disposed) return;
-      const next = readSelection();
-      if (next?.key !== selected?.key) {
-        retire(selected);
-        // Object identity is the route generation: A -> B -> A cannot revive
-        // asynchronous work captured by the first A selection.
-        selected = next && { ...next, controller: new AbortController(), revision: 0, due: 0, dirty: false, busy: false };
-      }
-      if (selected && Date.now() >= selected.due) schedule(selected, 0);
-    }
-
-    async function refresh(selection) {
-      selection.timer = undefined;
-      if (!current(selection)) return syncSelection();
-      selection.busy = true;
-      selection.dirty = false;
-      const revision = selection.revision;
-      const fresh = () => current(selection) && selection.revision === revision;
-      let acknowledged = false;
-      try {
-        const snapshot = await requestSnapshot(api, selection, requestMs);
-        if (!validSnapshot(snapshot)) throw new Error("Invalid lifecycle snapshot");
-        // Bookkeeping is not an agent state change: synthetic Working would
-        // reannounce a completion, while Unknown would erase unread attention.
-        // Briefly retain a confirmed report while retrying either kind of race.
-        if (current(selection) && (!fresh() || snapshot.reason === "refreshing")) {
-          deferSnapshot(selection, snapshot.reason === "refreshing");
-          return;
-        }
-        if (fresh()) {
-          clearFreshness(selection);
-          selection.rootID = snapshot.rootID;
-          // A send can reach Herdr even if its acknowledgement is lost or raced
-          // by new work. The older state no longer proves what the pane shows.
-          selection.confirmed = undefined;
-          acknowledged = await reporter.report(snapshot, {
-            signal: selection.controller.signal,
-            isCurrent: fresh,
-          });
-          if (acknowledged && fresh()) selection.confirmed = snapshot;
-        }
-      } catch {
-        // A missing first report leaves Herdr's screen detector in charge; a
-        // stale idle report also hides new background work. Neither is evidence
-        // of completion. Preserve known working/blocked states, otherwise claim
-        // unknown until the next authoritative read, without inventing ancestry.
-        if (current(selection) && (!selection.confirmed || selection.confirmed.state === "idle")) {
-          await reporter.report({ rootID: selection.rootID, state: "unknown", reason: "snapshot-unavailable" }, {
-            signal: selection.controller.signal,
-            // New work invalidates a successful snapshot, but cannot turn a
-            // failed read into evidence for retaining Idle. Navigation still fences it.
-            isCurrent: () => current(selection),
-          }).catch(() => false);
+        // Any read error means release: native detection is the fallback, never `unknown`.
+        const want = await desiredState(api).catch(() => undefined);
+        if (want !== sent && !disposed) {
+          const acknowledged = await (want ? herdr.hold(want, MESSAGES[want]) : herdr.release());
+          if (acknowledged) sent = want;
+          else if (want) sent = UNSURE;
         }
       } finally {
-        selection.busy = false;
-        selection.due = Date.now() + (acknowledged ? refreshMs : retryMs);
-        syncSelection();
-        if (selected === selection && selection.dirty) schedule(selection);
+        busy = false;
       }
     }
 
-    const unsubscribe = api.data.listen(({ details }) => {
-      if (disposed || !EVENTS.has(details?.type)) return;
-      syncSelection();
-      if (!selected) return;
-      selected.revision += 1;
-      selected.dirty = true;
-      schedule(selected);
-    });
-    const poll = setInterval(syncSelection, pollMs);
-    poll.unref?.();
-    syncSelection();
+    const timer = setInterval(tick, POLL_MS);
+    timer.unref?.();
+    void tick();
     return () => {
-      if (disposed) return;
       disposed = true;
-      clearInterval(poll);
-      retire(selected);
-      unsubscribe();
-      reporter.dispose();
+      clearInterval(timer);
+      return herdr.release();
     };
   },
 };
