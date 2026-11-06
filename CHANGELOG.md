@@ -1,3 +1,9 @@
+## [1.0.4](https://github.com/balakumardev/herdr-agent-lifecycle/compare/v1.0.3...v1.0.4) (2026-11-06)
+
+### Maintenance
+
+* reduce the plugin to a background-work overlay ([f085565](https://github.com/balakumardev/herdr-agent-lifecycle/commit/f0855656414e6dcb6a3840d28435aee55de363ac))
+
 ## [1.0.3](https://github.com/balakumardev/herdr-agent-lifecycle/compare/v1.0.2...v1.0.3) (2026-10-28)
 
 ### Fixes

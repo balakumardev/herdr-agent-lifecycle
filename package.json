@@ -1,6 +1,6 @@
 {
   "name": "herdr-agent-lifecycle",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "type": "module",
   "description": "Keeps Herdr showing Working while a Claude Code or OpenCode agent has subagents or background shells running",

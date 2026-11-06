@@ -1,6 +1,6 @@
 {
   "name": "opencode-herdr-lifecycle",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Keeps Herdr showing Working while an OpenCode V2 agent has subagents or background shells running",
   "license": "Apache-2.0",
   "repository": {
